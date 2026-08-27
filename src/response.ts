@@ -1,0 +1,148 @@
+import type { ReviewDecision } from "./types.js"
+
+const DECISIONS = new Set(["allow", "deny"])
+const RISKS = new Set(["low", "medium", "high", "critical", "unknown"])
+const AUTHORIZATIONS = new Set(["high", "medium", "low", "unknown"])
+const MAX_REASON_BYTES = 512
+const MAX_RULES = 16
+const MAX_RULE_BYTES = 64
+
+export function parseReviewResponse(text: string): ReviewDecision | undefined {
+  const trimmed = text.trim()
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return
+
+  let value: unknown
+  try {
+    value = new StrictJsonParser(trimmed).parse()
+  } catch {
+    return
+  }
+  if (!isRecord(value)) return
+
+  const keys = Object.keys(value).sort()
+  const expected = ["authorization", "decision", "matched_rules", "reason", "risk"]
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) return
+  if (!DECISIONS.has(value.decision as string)) return
+  if (!RISKS.has(value.risk as string)) return
+  if (!AUTHORIZATIONS.has(value.authorization as string)) return
+  if (typeof value.reason !== "string" || value.reason.trim() === "") return
+  if (Buffer.byteLength(value.reason, "utf8") > MAX_REASON_BYTES) return
+  if (/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(value.reason)) return
+  if (!Array.isArray(value.matched_rules) || value.matched_rules.length > MAX_RULES) return
+  if (value.matched_rules.some((rule) => typeof rule !== "string" || rule === "" || Buffer.byteLength(rule, "utf8") > MAX_RULE_BYTES)) return
+
+  const parsed: ReviewDecision = {
+    decision: value.decision as ReviewDecision["decision"],
+    risk: value.risk as ReviewDecision["risk"],
+    authorization: value.authorization as ReviewDecision["authorization"],
+    reason: value.reason,
+    matched_rules: [...value.matched_rules] as string[],
+  }
+  if (parsed.decision === "allow" && (parsed.risk !== "low" || !["high", "medium"].includes(parsed.authorization))) {
+    return { ...parsed, decision: "deny" }
+  }
+  return parsed
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+class StrictJsonParser {
+  #index = 0
+
+  constructor(readonly text: string) {}
+
+  parse(): unknown {
+    const value = this.#value()
+    this.#space()
+    if (this.#index !== this.text.length) throw new SyntaxError("trailing JSON data")
+    return value
+  }
+
+  #value(): unknown {
+    this.#space()
+    const char = this.text[this.#index]
+    if (char === "{") return this.#object()
+    if (char === "[") return this.#array()
+    if (char === '"') return this.#string()
+    if (char === "t") return this.#literal("true", true)
+    if (char === "f") return this.#literal("false", false)
+    if (char === "n") return this.#literal("null", null)
+    return this.#number()
+  }
+
+  #object(): Record<string, unknown> {
+    this.#index++
+    const value: Record<string, unknown> = Object.create(null)
+    const keys = new Set<string>()
+    this.#space()
+    if (this.text[this.#index] === "}") {
+      this.#index++
+      return value
+    }
+    while (true) {
+      this.#space()
+      if (this.text[this.#index] !== '"') throw new SyntaxError("object key must be a string")
+      const key = this.#string()
+      if (keys.has(key)) throw new SyntaxError("duplicate object key")
+      keys.add(key)
+      this.#space()
+      if (this.text[this.#index++] !== ":") throw new SyntaxError("missing colon")
+      value[key] = this.#value()
+      this.#space()
+      const delimiter = this.text[this.#index++]
+      if (delimiter === "}") return value
+      if (delimiter !== ",") throw new SyntaxError("invalid object delimiter")
+    }
+  }
+
+  #array(): unknown[] {
+    this.#index++
+    const value: unknown[] = []
+    this.#space()
+    if (this.text[this.#index] === "]") {
+      this.#index++
+      return value
+    }
+    while (true) {
+      value.push(this.#value())
+      this.#space()
+      const delimiter = this.text[this.#index++]
+      if (delimiter === "]") return value
+      if (delimiter !== ",") throw new SyntaxError("invalid array delimiter")
+    }
+  }
+
+  #string(): string {
+    const start = this.#index++
+    while (this.#index < this.text.length) {
+      const char = this.text[this.#index++]
+      if (char === "\\") {
+        this.#index++
+        continue
+      }
+      if (char === '"') return JSON.parse(this.text.slice(start, this.#index)) as string
+    }
+    throw new SyntaxError("unterminated string")
+  }
+
+  #number(): number {
+    const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(this.text.slice(this.#index))
+    if (!match) throw new SyntaxError("invalid JSON value")
+    this.#index += match[0].length
+    const value = Number(match[0])
+    if (!Number.isFinite(value)) throw new SyntaxError("non-finite number")
+    return value
+  }
+
+  #literal<T>(text: string, value: T): T {
+    if (!this.text.startsWith(text, this.#index)) throw new SyntaxError("invalid literal")
+    this.#index += text.length
+    return value
+  }
+
+  #space(): void {
+    while (/\s/u.test(this.text[this.#index] ?? "")) this.#index++
+  }
+}

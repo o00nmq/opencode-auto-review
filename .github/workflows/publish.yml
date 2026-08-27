@@ -1,0 +1,33 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm ci
+      - name: Verify tag
+        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - name: Verify packed exports
+        run: |
+          archive=$(npm pack --ignore-scripts --silent --pack-destination "$RUNNER_TEMP")
+          work=$(mktemp -d "$RUNNER_TEMP/package-smoke.XXXXXX")
+          cd "$work"
+          npm init -y >/dev/null
+          npm install "$RUNNER_TEMP/$archive" --ignore-scripts --silent
+          "$GITHUB_WORKSPACE/node_modules/.bin/tsx" -e "Promise.all([import('opencode-auto-review'), import('opencode-auto-review/tui')]).then(([server, tui]) => { if (server.default.tui !== true || tui.default.id !== 'opencode-auto-review.tui') process.exit(1) })"
+      - run: npm publish --access public

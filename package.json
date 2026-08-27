@@ -1,0 +1,57 @@
+{
+  "name": "opencode-auto-review",
+  "version": "0.1.0",
+  "description": "Fail-safe automatic review for OpenCode V2 permission prompts",
+  "keywords": [
+    "opencode",
+    "plugin",
+    "permissions",
+    "security"
+  ],
+  "author": "Suzukaaa",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/o00nmq/opencode-auto-review.git"
+  },
+  "homepage": "https://github.com/o00nmq/opencode-auto-review#readme",
+  "bugs": {
+    "url": "https://github.com/o00nmq/opencode-auto-review/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.tsx"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "test:smoke": "tsx smoke/live.ts",
+    "prepack": "npm run check && npm test"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "beta"
+  },
+  "peerDependencies": {
+    "@opentui/solid": ">=0.5.8",
+    "solid-js": ">=1.9.0"
+  },
+  "devDependencies": {
+    "@opentui/solid": "0.5.8",
+    "@types/node": "^24.3.0",
+    "solid-js": "^1.9.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT"
+}
