@@ -10,7 +10,6 @@ interface MessageInfo {
 export function buildReviewRequest(
   messages: readonly unknown[],
   event: PermissionEvent,
-  maxBytes = Number.MAX_SAFE_INTEGER,
 ): ReviewRequest | undefined {
   if (!event.source || event.source.type !== "tool") return
 
@@ -28,54 +27,36 @@ export function buildReviewRequest(
   const compactionIndex = findLatestCompaction(messages, sourceIndex)
   if (compactionIndex !== undefined && (messages[compactionIndex] as Record<string, unknown>).status === "running") return
   const startIndex = compactionIndex ?? 0
-  const history: Array<{ order: number; entry: ReviewContextEntry }> = []
-  let latestUserOrder: number | undefined
-  let order = 0
+  const history: ReviewContextEntry[] = []
+  let hasUser = false
 
   for (let index = startIndex; index < sourceIndex; index++) {
     const message = messages[index]
     if (!isRecord(message)) continue
     if (message.type === "compaction" && message.status === "completed" &&
       typeof message.summary === "string" && typeof message.recent === "string") {
-      history.push({ order: order++, entry: { type: "compaction", summary: message.summary, recent: message.recent } })
+      history.push({ type: "compaction", summary: message.summary, recent: message.recent })
       continue
     }
     if (message.type === "user" && typeof message.text === "string" && message.text.trim()) {
-      latestUserOrder = order
-      history.push({ order: order++, entry: { type: "user", text: message.text } })
+      hasUser = true
+      history.push({ type: "user", text: message.text })
       continue
     }
     if (message.type !== "assistant" || !Array.isArray(message.content)) continue
     for (const part of message.content) {
       const historicalTool = readCompleteToolPart(part)
-      if (historicalTool) history.push({ order: order++, entry: { type: "tool", ...historicalTool } })
+      if (historicalTool) history.push({ type: "tool", ...historicalTool })
     }
   }
-  if (latestUserOrder === undefined) return
+  if (!hasUser) return
 
-  const latestUser = history.find((item) => item.order === latestUserOrder)!
-  const selected = [latestUser]
-  let historyTruncated = false
-  for (let index = history.length - 1; index >= 0; index--) {
-    const candidate = history[index]!
-    if (candidate.order === latestUserOrder) continue
-    const next = [...selected, candidate].sort((left, right) => left.order - right.order)
-    if (serializedBytes(createRequest(next.map((item) => item.entry), true)) > maxBytes) {
-      historyTruncated = true
-      break
-    }
-    selected.splice(0, selected.length, ...next)
+  return {
+    context: [...history, { type: "tool", name: currentTool.name, input: currentTool.input }],
+    history_truncated: false,
+    permission: { action: event.action, resources: [...event.resources] },
   }
 
-  return createRequest(selected.map((item) => item.entry), historyTruncated)
-
-  function createRequest(context: ReviewContextEntry[], history_truncated: boolean): ReviewRequest {
-    return {
-      context: [...context, { type: "tool", name: currentTool.name, input: currentTool.input }],
-      history_truncated,
-      permission: { action: event.action, resources: [...event.resources] },
-    }
-  }
 }
 
 function findToolPart(parts: readonly unknown[] | undefined, id: string): { name: string; input: unknown } | undefined {
@@ -99,10 +80,6 @@ function findLatestCompaction(messages: readonly unknown[], sourceIndex: number)
       return index
     }
   }
-}
-
-function serializedBytes(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value), "utf8")
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

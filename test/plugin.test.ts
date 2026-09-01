@@ -29,6 +29,7 @@ function createHarness(
   let contextCalls = 0
   let disposed = 0
   let generationSignal: AbortSignal | undefined
+  const generatedPrompts: string[] = []
   const synthetic: string[] = []
   const syntheticDescriptions: string[] = []
   let commandDescription = ""
@@ -64,8 +65,9 @@ function createHarness(
         syntheticDescriptions.push(description)
       },
     },
-    generate: { text: async (_input: unknown, requestOptions: { signal?: AbortSignal }) => {
+    generate: { text: async (input: any, requestOptions: { signal?: AbortSignal }) => {
       generateCalls++
+      generatedPrompts.push(input.prompt)
       generationSignal = requestOptions.signal
       return typeof generate === "function" ? generate() : { text: generate }
     } },
@@ -101,6 +103,7 @@ function createHarness(
     visibleStatus: () => syntheticDescriptions.at(-1),
     messages,
     generationSignal: () => generationSignal,
+    generatedPrompts: () => generatedPrompts,
   }
 }
 
@@ -112,6 +115,21 @@ test("only a valid eligible ask can be auto-allowed", async () => {
   assert.deepEqual(harness.counts(), { generateCalls: 1, contextCalls: 1, disposed: 0 })
   await cleanup?.()
   assert.equal(harness.counts().disposed, 1)
+})
+
+test("reuses a hidden append-only pseudo-reviewer per main session", async () => {
+  const harness = createHarness()
+  await harness.setup()
+  await harness.run()
+  harness.messages[1]!.content[0].state.status = "completed"
+  harness.messages.push({ id: "assistant2", type: "assistant", content: [
+    { type: "tool", id: "tool2", name: "read", state: { status: "running", input: { path: "README.md" } } },
+  ] })
+  await harness.run({ source: { type: "tool", messageID: "assistant2", id: "tool2" } })
+  const prompts = harness.generatedPrompts()
+  assert.equal(prompts.length, 2)
+  assert.ok(prompts[1]!.startsWith(`${prompts[0]!}\n`))
+  assert.doesNotMatch(prompts[1]!, /Narrow read|review_outcome/)
 })
 
 test("reviewer denial returns a concise reason and safe retry guidance", async () => {

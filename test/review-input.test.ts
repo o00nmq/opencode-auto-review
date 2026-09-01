@@ -53,23 +53,6 @@ test("rejects partial or unlocatable requests", () => {
   assert.equal(buildReviewRequest([{ id: "msg_source", type: "assistant", content: [] }], event), undefined)
 })
 
-test("keeps recent complete history within the byte budget and marks omission", () => {
-  const messages = [
-    { id: "user_old", type: "user", text: "x".repeat(400) },
-    { id: "user_current", type: "user", text: "Inspect it" },
-    { id: "msg_source", type: "assistant", content: [
-      { type: "tool", id: "tool_target", name: "read", state: { status: "running", input: { path: "a.ts" } } },
-    ] },
-  ]
-  const request = buildReviewRequest(messages, event, 300)
-  assert.deepEqual(request?.context, [
-    { type: "user", text: "Inspect it" },
-    { type: "tool", name: "read", input: { path: "a.ts" } },
-  ])
-  assert.equal(request?.history_truncated, true)
-  assert.ok(Buffer.byteLength(JSON.stringify(request), "utf8") <= 300)
-})
-
 test("treats completed compaction as untrusted context and requires a later real user message", () => {
   const compaction = {
     id: "compact", type: "compaction", status: "completed", reason: "auto",

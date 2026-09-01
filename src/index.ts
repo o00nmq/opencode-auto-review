@@ -1,15 +1,16 @@
 import { Plugin } from "@opencode-ai/plugin"
 import { createHash } from "node:crypto"
 import { ReviewCoordinator } from "./coordinator.js"
+import { KeyedQueue } from "./keyed-queue.js"
 import {
-  buildReviewPrompt,
   findHumanReviewReason,
   isEligibleAction,
   parseOptions,
 } from "./policy.js"
 import { buildReviewRequest } from "./review-input.js"
+import { prepareReviewJournal } from "./reviewer-journal.js"
 import { parseReviewResponse } from "./response.js"
-import type { PermissionEvent, ReviewDecision, ReviewRequest } from "./types.js"
+import type { PermissionEvent, ReviewDecision, ReviewerJournalState, ReviewRequest } from "./types.js"
 
 const FAILURE_MESSAGE = "Auto-review denied: the request could not be verified safely. Retry later or use a safer approach."
 
@@ -35,6 +36,8 @@ export default Plugin.define({
     let pendingModel: Promise<ReviewerModel | undefined> | undefined
     const coordinator = new ReviewCoordinator<ReviewOutcome>(options.maxConcurrentReviews, options.maxQueuedReviews)
     const activeControllers = new Set<AbortController>()
+    const reviewerQueue = new KeyedQueue()
+    const reviewerStates = new Map<string, ReviewerJournalState>()
     let disposed = false
     const diagnose = (data: Record<string, string>) => {
       if (options.debug) console.info(`opencode-auto-review ${JSON.stringify(data)}`)
@@ -88,11 +91,11 @@ export default Plugin.define({
           }
           if (controller.signal.aborted) return { code: "timeout" }
 
-          const serialized = JSON.stringify(request)
-          if (Buffer.byteLength(serialized, "utf8") > options.maxReviewBytes) {
+          const decision = await reviewerQueue.run(event.sessionID, controller.signal, async () =>
+            generateReview(event.sessionID, request, controller.signal))
+          if (decision === "oversized") {
             return { message: "The complete tool request is too large for automatic review", code: "oversized" }
           }
-          const decision = await generateReview(request, controller.signal)
           return decision ? { decision, code: decision.decision } : { code: "review_failure" }
         }), controller.signal)
         if (disposed) return
@@ -122,12 +125,20 @@ export default Plugin.define({
       }
     })
 
-    async function generateReview(request: ReviewRequest, signal: AbortSignal): Promise<ReviewDecision | undefined> {
+    async function generateReview(
+      sessionID: string,
+      request: ReviewRequest,
+      signal: AbortSignal,
+    ): Promise<ReviewDecision | "oversized" | undefined> {
       const selectedModel = await getModel()
       if (!selectedModel) return
+      const prepared = prepareReviewJournal(reviewerStates.get(sessionID), request, options.maxReviewBytes)
+      if (!prepared) return "oversized"
+      const { prompt, ...state } = prepared
+      reviewerStates.set(sessionID, state)
       try {
         const result = await ctx.generate.text(
-          { prompt: buildReviewPrompt(request), model: selectedModel },
+          { prompt, model: selectedModel },
           { signal },
         )
         if (signal.aborted) return
@@ -152,7 +163,7 @@ export default Plugin.define({
       for (let attempt = 0; attempt < 4; attempt++) {
         const messages = await ctx.session.context({ sessionID: event.sessionID }, { signal })
         if (signal.aborted) return
-        const request = buildReviewRequest(messages, event, options.maxReviewBytes)
+        const request = buildReviewRequest(messages, event)
         if (request) return request
         if (attempt < 3) await delay(25 * 2 ** attempt, signal)
       }
@@ -172,6 +183,8 @@ export default Plugin.define({
       disposed = true
       coordinator.dispose()
       for (const controller of activeControllers) controller.abort()
+      reviewerQueue.clear()
+      reviewerStates.clear()
       await registration.dispose()
       await commandRegistration.dispose()
     }

@@ -35,3 +35,11 @@ export interface ReviewDecision {
   reason: string
   matched_rules: string[]
 }
+
+export interface ReviewerJournalState {
+  version: 2
+  epoch: number
+  sourceLength: number
+  sourceDigest: string
+  lines: string[]
+}

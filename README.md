@@ -47,7 +47,7 @@ Options and defaults:
 
 Use `/auto-review on`, `/auto-review off`, `/auto-review toggle`, or `/auto-review status`. The TUI also provides **Toggle Auto-review** in the command palette and displays `Auto Mode` while enabled.
 
-The plugin reviews only eligible tool requests whose current permission effect is `ask`. Existing `allow` and `deny` rules are not overridden. Invalid input, unsafe decisions, timeouts, and provider failures are denied. Review requests contain bounded user and tool-call context and exclude assistant reasoning, tool results, attachments, skills, and synthetic messages.
+The plugin reviews only eligible tool requests whose current permission effect is `ask`. Existing `allow` and `deny` rules are not overridden. Invalid input, unsafe decisions, timeouts, and provider failures are denied. Reviewer context is bounded and never enters OpenCode session history. It excludes assistant reasoning, tool results, attachments, skills, synthetic messages, and prior reviewer decisions.
 
 ## Development
 
