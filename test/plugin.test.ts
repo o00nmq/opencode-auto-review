@@ -6,7 +6,6 @@ const allowText = JSON.stringify({
   decision: "allow",
   risk: "low",
   authorization: "high",
-  reason: "Narrow read",
   matched_rules: [],
 })
 
@@ -14,8 +13,16 @@ const denyText = JSON.stringify({
   decision: "deny",
   risk: "high",
   authorization: "low",
-  reason: "The command may expose environment secrets",
+  reason: "The command may expose environment secrets; inspect only the specific non-secret configuration needed for the task",
   matched_rules: ["secret-access"],
+})
+
+const mediumText = JSON.stringify({
+  decision: "allow",
+  risk: "low",
+  authorization: "medium",
+  reason: "Relevant but not explicitly authorized",
+  matched_rules: [],
 })
 
 function createHarness(
@@ -132,14 +139,22 @@ test("reuses a hidden append-only pseudo-reviewer per main session", async () =>
   assert.doesNotMatch(prompts[1]!, /Narrow read|review_outcome/)
 })
 
-test("reviewer denial returns a concise reason and safe retry guidance", async () => {
+test("denial returns detailed guidance in the tool error", async () => {
   const harness = createHarness({}, denyText)
   await harness.setup()
   const event = await harness.run()
   assert.equal(event.effect, "deny")
-  assert.match((event as any).message, /environment secrets/)
+  assert.match((event as any).message, /specific non-secret configuration/)
   assert.match((event as any).message, /shell expansion/)
-  assert.doesNotMatch((event as any).message, /secret-access/)
+  assert.equal(harness.visibleStatus(), undefined)
+})
+
+test("medium authorization is allowed and shows its rationale", async () => {
+  const harness = createHarness({}, mediumText)
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "allow")
+  assert.equal(harness.visibleStatus(), "Auto-review approved: Relevant but not explicitly authorized")
 })
 
 test("runtime command toggles auto-review without restarting", async () => {
@@ -189,7 +204,7 @@ test("provider errors fail closed to deny", async () => {
   await harness.setup()
   const event = await harness.run()
   assert.equal(event.effect, "deny")
-  assert.equal((event as any).message, "Auto-review denied: the request could not be verified safely. Retry later or use a safer approach.")
+  assert.match((event as any).message, /could not be verified safely/)
 })
 
 test("missing reviewer agent uses the OpenCode default model", async () => {

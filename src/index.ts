@@ -12,7 +12,7 @@ import { prepareReviewJournal } from "./reviewer-journal.js"
 import { parseReviewResponse } from "./response.js"
 import type { PermissionEvent, ReviewDecision, ReviewerJournalState, ReviewRequest } from "./types.js"
 
-const FAILURE_MESSAGE = "Auto-review denied: the request could not be verified safely. Retry later or use a safer approach."
+const FAILURE_MESSAGE = "The request could not be verified safely. Retry later or use a safer approach."
 
 interface ReviewOutcome {
   decision?: ReviewDecision
@@ -71,8 +71,7 @@ export default Plugin.define({
 
       const humanReason = findHumanReviewReason(event.action, event.resources, options.humanReviewRules)
       if (humanReason) {
-        event.effect = "deny"
-        event.message = denialMessage(humanReason)
+        deny(event as PermissionEvent, humanReason)
         diagnose({ action: event.action, outcome: "human_rule" })
         return
       }
@@ -102,22 +101,21 @@ export default Plugin.define({
         diagnose({ action: event.action, request: key, outcome: outcome?.code ?? "queue_unavailable" })
         if (outcome?.decision?.decision === "allow") {
           event.effect = "allow"
+          const notice = outcome.decision.authorization === "medium"
+            ? reviewMessage("approved", outcome.decision.reason!)
+            : `Auto-review approved: ${event.action}.`
           try {
-            await showStatus(event.sessionID, "steer", `Auto-review approved: ${event.action}.`)
+            await showStatus(event.sessionID, "steer", notice)
           } catch {
             diagnose({ action: event.action, outcome: "approval_notice_failure" })
           }
           return
         }
-        event.effect = "deny"
-        event.message = outcome?.decision
-          ? denialMessage(outcome.decision.reason)
-          : outcome?.message ?? FAILURE_MESSAGE
+        deny(event as PermissionEvent, outcome?.decision?.reason ?? outcome?.message ?? FAILURE_MESSAGE)
       } catch {
         if (!disposed) {
           diagnose({ action: event.action, outcome: controller.signal.aborted ? "timeout" : "failure" })
-          event.effect = "deny"
-          event.message = FAILURE_MESSAGE
+          deny(event as PermissionEvent, FAILURE_MESSAGE)
         }
       } finally {
         clearTimeout(timer)
@@ -179,6 +177,11 @@ export default Plugin.define({
       })
     }
 
+    function deny(event: PermissionEvent, reason: string): void {
+      event.effect = "deny"
+      event.message = denialMessage(reason)
+    }
+
     return async () => {
       disposed = true
       coordinator.dispose()
@@ -190,6 +193,10 @@ export default Plugin.define({
     }
   },
 })
+
+function reviewMessage(outcome: "approved", reason: string): string {
+  return `Auto-review ${outcome}: ${reason.trim()}`
+}
 
 function denialMessage(reason: string): string {
   return `Auto-review denied: ${reason.trim()} Do not retry unchanged or bypass this decision with obfuscation, indirection, shell expansion, or hidden output; use a materially safer approach.`

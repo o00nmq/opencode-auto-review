@@ -3,7 +3,7 @@ import type { ReviewDecision } from "./types.js"
 const DECISIONS = new Set(["allow", "deny"])
 const RISKS = new Set(["low", "medium", "high", "critical", "unknown"])
 const AUTHORIZATIONS = new Set(["high", "medium", "low", "unknown"])
-const MAX_REASON_BYTES = 512
+const MAX_REASON_BYTES = 2048
 const MAX_RULES = 16
 const MAX_RULE_BYTES = 64
 
@@ -19,29 +19,36 @@ export function parseReviewResponse(text: string): ReviewDecision | undefined {
   }
   if (!isRecord(value)) return
 
-  const keys = Object.keys(value).sort()
-  const expected = ["authorization", "decision", "matched_rules", "reason", "risk"]
-  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) return
+  const keys = Object.keys(value)
+  const allowed = new Set(["authorization", "decision", "matched_rules", "reason", "risk"])
+  if (keys.some((key) => !allowed.has(key))) return
+  if (["authorization", "decision", "matched_rules", "risk"].some((key) => !keys.includes(key))) return
   if (!DECISIONS.has(value.decision as string)) return
   if (!RISKS.has(value.risk as string)) return
   if (!AUTHORIZATIONS.has(value.authorization as string)) return
-  if (typeof value.reason !== "string" || value.reason.trim() === "") return
-  if (Buffer.byteLength(value.reason, "utf8") > MAX_REASON_BYTES) return
-  if (/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(value.reason)) return
+  if (value.reason !== undefined && (typeof value.reason !== "string" || value.reason.trim() === "")) return
+  if (typeof value.reason === "string" && Buffer.byteLength(value.reason, "utf8") > MAX_REASON_BYTES) return
+  const unsafeText = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u
+  if (typeof value.reason === "string" && unsafeText.test(value.reason)) return
   if (!Array.isArray(value.matched_rules) || value.matched_rules.length > MAX_RULES) return
   if (value.matched_rules.some((rule) => typeof rule !== "string" || rule === "" || Buffer.byteLength(rule, "utf8") > MAX_RULE_BYTES)) return
 
-  const parsed: ReviewDecision = {
-    decision: value.decision as ReviewDecision["decision"],
+  const inconsistentAllow = value.decision === "allow" &&
+    (value.risk !== "low" || !["high", "medium"].includes(value.authorization as string))
+  const decision = inconsistentAllow ? "deny" : value.decision as ReviewDecision["decision"]
+  const reason = inconsistentAllow
+    ? "The reviewer response conflicts with the safety decision matrix"
+    : value.reason
+  if ((decision === "deny" || (decision === "allow" && value.authorization === "medium")) &&
+    typeof reason !== "string") return
+
+  return {
+    decision,
     risk: value.risk as ReviewDecision["risk"],
     authorization: value.authorization as ReviewDecision["authorization"],
-    reason: value.reason,
+    ...(typeof reason === "string" ? { reason } : {}),
     matched_rules: [...value.matched_rules] as string[],
   }
-  if (parsed.decision === "allow" && (parsed.risk !== "low" || !["high", "medium"].includes(parsed.authorization))) {
-    return { ...parsed, decision: "deny" }
-  }
-  return parsed
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

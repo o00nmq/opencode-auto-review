@@ -32,7 +32,7 @@ export interface ReviewDecision {
   decision: "allow" | "deny"
   risk: "low" | "medium" | "high" | "critical" | "unknown"
   authorization: "high" | "medium" | "low" | "unknown"
-  reason: string
+  reason?: string
   matched_rules: string[]
 }
 

@@ -12,6 +12,9 @@ const valid = {
 
 test("accepts a matrix-consistent allow", () => {
   assert.deepEqual(parseReviewResponse(`  ${JSON.stringify(valid)}\n`), valid)
+  assert.deepEqual(parseReviewResponse(JSON.stringify({
+    decision: "allow", risk: "low", authorization: "high", matched_rules: [],
+  })), { decision: "allow", risk: "low", authorization: "high", matched_rules: [] })
 })
 
 test("converts contradictory allows to deny", () => {
