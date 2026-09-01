@@ -1,8 +1,10 @@
 # OpenCode Auto Review
 
-Automatically reviews selected OpenCode V2 permission prompts. Safe requests can proceed without a human prompt; unsafe or unverifiable requests are denied.
+Automatically reviews selected **OpenCode V2** permission prompts. Safe requests can proceed without a human prompt; unsafe or unverifiable requests are denied.
 
 This plugin is not a sandbox. Keep appropriate OpenCode permissions and system isolation in place.
+
+OpenCode V1 is not supported. Its plugin API is incompatible; use OpenCode V2 to load this plugin.
 
 ## Install
 
