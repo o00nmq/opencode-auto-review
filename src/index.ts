@@ -3,16 +3,20 @@ import { createHash } from "node:crypto"
 import { ReviewCoordinator } from "./coordinator.js"
 import { KeyedQueue } from "./keyed-queue.js"
 import {
+  buildFastReviewPrompt,
+  buildReviewPrompt,
   findHumanReviewReason,
   isEligibleAction,
   parseOptions,
 } from "./policy.js"
 import { buildReviewRequest } from "./review-input.js"
 import { prepareReviewJournal } from "./reviewer-journal.js"
-import { parseReviewResponse } from "./response.js"
+import { parseFastReviewResponse, parseReviewResponse } from "./response.js"
 import type { PermissionEvent, ReviewDecision, ReviewerJournalState, ReviewRequest } from "./types.js"
 
 const FAILURE_MESSAGE = "The request could not be verified safely. Retry later or use a safer approach."
+const TIMEOUT_MESSAGE = "Automatic review timed out before reaching a decision. This is not a safety judgment about the requested action. Ask the user for explicit approval."
+const REVIEWER_FAILURE_MESSAGE = "Automatic review did not return a complete valid decision. This is not a safety judgment about the requested action. Retry the same request once, or ask the user for explicit approval."
 
 interface ReviewOutcome {
   decision?: ReviewDecision
@@ -34,6 +38,7 @@ export default Plugin.define({
     let enabled = options.enabled
     let model: ReviewerModel | undefined
     let pendingModel: Promise<ReviewerModel | undefined> | undefined
+    const modelController = new AbortController()
     const coordinator = new ReviewCoordinator<ReviewOutcome>(options.maxConcurrentReviews, options.maxQueuedReviews)
     const activeControllers = new Set<AbortController>()
     const reviewerQueue = new KeyedQueue()
@@ -71,14 +76,13 @@ export default Plugin.define({
 
       const humanReason = findHumanReviewReason(event.action, event.resources, options.humanReviewRules)
       if (humanReason) {
-        deny(event as PermissionEvent, humanReason)
+        denyPolicy(event as PermissionEvent, humanReason)
         diagnose({ action: event.action, outcome: "human_rule" })
         return
       }
 
       const controller = new AbortController()
       activeControllers.add(controller)
-      const timer = setTimeout(() => controller.abort(), options.timeoutMs)
       try {
         const key = requestIdentity(event as PermissionEvent)
         diagnose({ action: event.action, request: key, outcome: "started" })
@@ -95,7 +99,12 @@ export default Plugin.define({
           if (decision === "oversized") {
             return { message: "The complete tool request is too large for automatic review", code: "oversized" }
           }
-          return decision ? { decision, code: decision.decision } : { code: "review_failure" }
+          if (decision === "ask") return { code: "ask" }
+          if (decision === "timeout") return { message: TIMEOUT_MESSAGE, code: "timeout" }
+          return decision ? { decision, code: decision.decision } : {
+            message: REVIEWER_FAILURE_MESSAGE,
+            code: "review_failure",
+          }
         }), controller.signal)
         if (disposed) return
         diagnose({ action: event.action, request: key, outcome: outcome?.code ?? "queue_unavailable" })
@@ -111,14 +120,15 @@ export default Plugin.define({
           }
           return
         }
-        deny(event as PermissionEvent, outcome?.decision?.reason ?? outcome?.message ?? FAILURE_MESSAGE)
+        if (outcome?.code === "ask") return
+        if (outcome?.decision) denyPolicy(event as PermissionEvent, outcome.decision.reason ?? FAILURE_MESSAGE)
+        else denyOperational(event as PermissionEvent, outcome?.message ?? FAILURE_MESSAGE)
       } catch {
         if (!disposed) {
-          diagnose({ action: event.action, outcome: controller.signal.aborted ? "timeout" : "failure" })
-          deny(event as PermissionEvent, FAILURE_MESSAGE)
+          diagnose({ action: event.action, outcome: controller.signal.aborted ? "aborted" : "failure" })
+          denyOperational(event as PermissionEvent, REVIEWER_FAILURE_MESSAGE)
         }
       } finally {
-        clearTimeout(timer)
         activeControllers.delete(controller)
       }
     })
@@ -127,28 +137,80 @@ export default Plugin.define({
       sessionID: string,
       request: ReviewRequest,
       signal: AbortSignal,
-    ): Promise<ReviewDecision | "oversized" | undefined> {
+    ): Promise<ReviewDecision | "oversized" | "timeout" | "ask" | undefined> {
       const selectedModel = await getModel()
-      if (!selectedModel) return
-      const prepared = prepareReviewJournal(reviewerStates.get(sessionID), request, options.maxReviewBytes)
+      if (!selectedModel || signal.aborted) return
+      const prepared = prepareReviewJournal(
+        reviewerStates.get(sessionID),
+        request,
+        options.maxReviewBytes,
+        options.maxReviewTokens,
+      )
       if (!prepared) return "oversized"
-      const { prompt, ...state } = prepared
+      const { prompt: _prompt, ...state } = prepared
       reviewerStates.set(sessionID, state)
       try {
-        const result = await ctx.generate.text(
-          { prompt, model: selectedModel },
-          { signal },
+        const fast = await generateStage(
+          buildFastReviewPrompt(state.lines),
+          selectedModel,
+          options.fastTimeoutMs,
+          signal,
         )
         if (signal.aborted) return
-        return parseReviewResponse(result.text)
+        if (parseFastReviewResponse(fast.text ?? "") === "allow") {
+          return {
+            decision: "allow",
+            risk: "low",
+            authorization: "high",
+            matched_rules: ["fast-screen"],
+          }
+        }
+        const full = await generateStage(
+          buildReviewPrompt(state.lines, options.maxReviewTokens),
+          selectedModel,
+          options.timeoutMs,
+          signal,
+        )
+        if (signal.aborted) return
+        if (full.timedOut) return fast.timedOut ? "ask" : "timeout"
+        return parseReviewResponse(full.text ?? "")
       } catch {
         return
       }
     }
 
+    async function generateStage(
+      prompt: string,
+      selectedModel: ReviewerModel,
+      timeoutMs: number,
+      parentSignal: AbortSignal,
+    ): Promise<{ text?: string; timedOut: boolean }> {
+      if (parentSignal.aborted) return { timedOut: false }
+      const controller = new AbortController()
+      let timedOut = false
+      const onParentAbort = () => controller.abort()
+      parentSignal.addEventListener("abort", onParentAbort, { once: true })
+      const timer = setTimeout(() => {
+        timedOut = true
+        controller.abort()
+      }, timeoutMs)
+      try {
+        const result = await raceWithAbort(ctx.generate.text(
+          { prompt, model: selectedModel },
+          { signal: controller.signal },
+        ), controller.signal)
+        return { text: result.text, timedOut: false }
+      } catch {
+        return { timedOut }
+      } finally {
+        clearTimeout(timer)
+        parentSignal.removeEventListener("abort", onParentAbort)
+      }
+    }
+
     async function getModel(): Promise<ReviewerModel | undefined> {
       if (model) return model
-      pendingModel ??= resolveModel(ctx, options.agent, options.model, options.timeoutMs)
+      pendingModel ??= resolveModel(ctx, options.agent, options.model, options.timeoutMs, modelController.signal)
       try {
         model = await pendingModel
         return model
@@ -177,13 +239,19 @@ export default Plugin.define({
       })
     }
 
-    function deny(event: PermissionEvent, reason: string): void {
+    function denyPolicy(event: PermissionEvent, reason: string): void {
       event.effect = "deny"
       event.message = denialMessage(reason)
     }
 
+    function denyOperational(event: PermissionEvent, reason: string): void {
+      event.effect = "deny"
+      event.message = `Auto-review unavailable: ${reason.trim()}`
+    }
+
     return async () => {
       disposed = true
+      modelController.abort()
       coordinator.dispose()
       for (const controller of activeControllers) controller.abort()
       reviewerQueue.clear()
@@ -250,21 +318,27 @@ async function resolveModel(
   agentID: string,
   configured: string | undefined,
   timeoutMs: number,
+  parentSignal: AbortSignal,
 ): Promise<ReviewerModel | undefined> {
+  if (parentSignal.aborted) return
   if (configured) return parseModel(configured)
   const controller = new AbortController()
+  const onParentAbort = () => controller.abort()
+  parentSignal.addEventListener("abort", onParentAbort, { once: true })
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     try {
       const agent = await raceWithAbort(ctx.agent.get({ agentID }, { signal: controller.signal }), controller.signal)
       if (agent.data.model) return copyModel(agent.data.model)
     } catch {}
+    if (controller.signal.aborted) return
     try {
       const fallback = await raceWithAbort(ctx.catalog.model.default({}, { signal: controller.signal }), controller.signal)
       if (fallback.data) return copyModel(fallback.data)
     } catch {}
   } finally {
     clearTimeout(timer)
+    parentSignal.removeEventListener("abort", onParentAbort)
   }
 }
 

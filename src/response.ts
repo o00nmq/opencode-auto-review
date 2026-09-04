@@ -7,6 +7,17 @@ const MAX_REASON_BYTES = 2048
 const MAX_RULES = 16
 const MAX_RULE_BYTES = 64
 
+export function parseFastReviewResponse(text: string): "allow" | "review" | undefined {
+  let value: unknown
+  try {
+    value = new StrictJsonParser(text.trim()).parse()
+  } catch {
+    return
+  }
+  if (!isRecord(value) || Object.keys(value).length !== 1) return
+  return value.decision === "allow" || value.decision === "review" ? value.decision : undefined
+}
+
 export function parseReviewResponse(text: string): ReviewDecision | undefined {
   const trimmed = text.trim()
   if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return

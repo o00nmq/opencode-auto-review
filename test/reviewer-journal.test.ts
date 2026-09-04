@@ -39,14 +39,14 @@ test("history discontinuity or capacity starts a new bounded epoch", () => {
     { type: "user", text: "Inspect files" },
     { type: "tool", name: "read", input: { path: "a.ts" } },
   ])
-  const capacityFirst = prepareReviewJournal(undefined, firstRequest, 4_400)!
+  const capacityFirst = prepareReviewJournal(undefined, firstRequest, 4_850)!
   const capacitySecond = prepareReviewJournal(capacityFirst, request([
     ...firstRequest.context,
     { type: "tool", name: "read", input: { path: "b.ts", note: "x".repeat(1_000) } },
-  ]), 4_400)!
+  ]), 4_850)!
 
   assert.equal(capacitySecond.epoch, 1)
-  assert.ok(Buffer.byteLength(capacitySecond.prompt, "utf8") <= 4_400)
+  assert.ok(Buffer.byteLength(capacitySecond.prompt, "utf8") <= 4_850)
   assert.equal(capacitySecond.prompt.startsWith(`${capacityFirst.prompt}\n`), false)
 })
 
@@ -57,7 +57,7 @@ test("new epochs anchor first and latest users before other history", () => {
     { type: "user", text: `MIDDLE_${"m".repeat(500)}` },
     { type: "user", text: "LATEST_REQUEST" },
     { type: "tool", name: "read", input: { path: "a.ts" } },
-  ]), 3_500)!
+  ]), 3_900)!
 
   assert.match(prepared.prompt, /FIRST_CONSTRAINT/)
   assert.match(prepared.prompt, /LATEST_REQUEST/)
@@ -70,11 +70,11 @@ test("the byte limit covers fixed policy, framing, and the exact current action"
     { type: "user", text: "Inspect it" },
     { type: "tool", name: "read", input: { path: "a.ts" } },
   ])
-  const prepared = prepareReviewJournal(undefined, input, 3_400)!
-  assert.ok(Buffer.byteLength(prepared.prompt, "utf8") <= 3_400)
-  assert.equal(prepareReviewJournal(undefined, input, 2_600), undefined)
+  const prepared = prepareReviewJournal(undefined, input, 3_800)!
+  assert.ok(Buffer.byteLength(prepared.prompt, "utf8") <= 3_800)
+  assert.equal(prepareReviewJournal(undefined, input, 3_700), undefined)
   assert.equal(prepareReviewJournal(undefined, request([
     { type: "user", text: "Inspect it" },
     { type: "tool", name: "read", input: { path: "x".repeat(2_000) } },
-  ]), 3_500), undefined)
+  ]), 5_000), undefined)
 })

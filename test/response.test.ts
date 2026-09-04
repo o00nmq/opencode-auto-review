@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { parseReviewResponse } from "../src/response.js"
+import { parseFastReviewResponse, parseReviewResponse } from "../src/response.js"
 
 const valid = {
   decision: "allow",
@@ -15,6 +15,12 @@ test("accepts a matrix-consistent allow", () => {
   assert.deepEqual(parseReviewResponse(JSON.stringify({
     decision: "allow", risk: "low", authorization: "high", matched_rules: [],
   })), { decision: "allow", risk: "low", authorization: "high", matched_rules: [] })
+})
+
+test("accepts only the two minimal fast-screen decisions", () => {
+  assert.equal(parseFastReviewResponse('{"decision":"allow"}'), "allow")
+  assert.equal(parseFastReviewResponse('{"decision":"review"}'), "review")
+  assert.equal(parseFastReviewResponse('{"decision":"allow","reason":"extra"}'), undefined)
 })
 
 test("converts contradictory allows to deny", () => {

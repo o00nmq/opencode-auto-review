@@ -25,9 +25,12 @@ const mediumText = JSON.stringify({
   matched_rules: [],
 })
 
+const fastAllowText = JSON.stringify({ decision: "allow" })
+const fastReviewText = JSON.stringify({ decision: "review" })
+
 function createHarness(
   options: Record<string, unknown> = {},
-  generate: string | (() => Promise<{ text: string }>) = allowText,
+  generate: string | ((input: any, options: { signal?: AbortSignal }) => Promise<{ text: string }>) = allowText,
   context?: () => Promise<any[]>,
 ) {
   let evaluate: ((event: any) => Promise<void>) | undefined
@@ -76,7 +79,9 @@ function createHarness(
       generateCalls++
       generatedPrompts.push(input.prompt)
       generationSignal = requestOptions.signal
-      return typeof generate === "function" ? generate() : { text: generate }
+      if (typeof generate === "function") return generate(input, requestOptions)
+      const fast = input.prompt.includes("fast conservative screen")
+      return { text: fast ? (generate === allowText ? fastAllowText : fastReviewText) : generate }
     } },
     agent: { get: async () => { throw new Error("missing") } },
     catalog: { model: { default: async () => ({ data: { providerID: "test", id: "reviewer" } }) } },
@@ -196,7 +201,7 @@ test("malformed reviewer output fails closed to deny", async () => {
   await harness.setup()
   const event = await harness.run()
   assert.equal(event.effect, "deny")
-  assert.match((event as any).message, /could not be verified safely/)
+  assert.match((event as any).message, /did not return a complete valid decision/)
 })
 
 test("provider errors fail closed to deny", async () => {
@@ -204,7 +209,7 @@ test("provider errors fail closed to deny", async () => {
   await harness.setup()
   const event = await harness.run()
   assert.equal(event.effect, "deny")
-  assert.match((event as any).message, /could not be verified safely/)
+  assert.match((event as any).message, /did not return a complete valid decision/)
 })
 
 test("missing reviewer agent uses the OpenCode default model", async () => {
@@ -225,14 +230,33 @@ test("oversized complete input is denied without model disclosure", async () => 
   assert.equal(harness.counts().generateCalls, 0)
 })
 
-test("timeout aborts the provider request and denies", async () => {
-  const harness = createHarness({ timeoutMs: 1000 }, () => new Promise(() => undefined))
+test("two review timeouts abort both requests and return to user approval", async () => {
+  const harness = createHarness({ fastTimeoutMs: 1000, timeoutMs: 1000 }, () => new Promise(() => undefined))
   await harness.setup()
   const started = Date.now()
   const event = await harness.run()
-  assert.ok(Date.now() - started >= 900)
-  assert.equal(event.effect, "deny")
+  assert.ok(Date.now() - started >= 1900)
+  assert.equal(event.effect, "ask")
+  assert.equal(harness.counts().generateCalls, 2)
   assert.equal(harness.generationSignal()?.aborted, true)
+})
+
+test("only two timeouts return to user approval", async () => {
+  let calls = 0
+  const fastTimeout = createHarness({ fastTimeoutMs: 1000 }, async (_input, { signal }) => {
+    if (calls++ === 0) return aborts(signal!)
+    return { text: allowText }
+  })
+  await fastTimeout.setup()
+  assert.equal((await fastTimeout.run()).effect, "allow")
+
+  calls = 0
+  const deepTimeout = createHarness({ timeoutMs: 1000 }, async (_input, { signal }) => {
+    if (calls++ === 0) return { text: fastReviewText }
+    return aborts(signal!)
+  })
+  await deepTimeout.setup()
+  assert.equal((await deepTimeout.run()).effect, "deny")
 })
 
 test("cleanup prevents a late review from changing the event", async () => {
@@ -248,3 +272,10 @@ test("cleanup prevents a late review from changing the event", async () => {
   assert.equal(event.effect, "ask")
   assert.equal(harness.generationSignal()?.aborted, true)
 })
+
+function aborts(signal: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    if (signal.aborted) return reject(new Error("aborted"))
+    signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true })
+  })
+}

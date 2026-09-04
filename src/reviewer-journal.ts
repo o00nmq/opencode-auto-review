@@ -14,6 +14,7 @@ export function prepareReviewJournal(
   stored: unknown,
   request: ReviewRequest,
   maxBytes: number,
+  reasoningTokens = 4_096,
 ): PreparedReviewJournal | undefined {
   const previous = readState(stored)
   const historical = request.context.slice(0, -1)
@@ -27,20 +28,27 @@ export function prepareReviewJournal(
       ...historical.slice(previous.sourceLength).map(serialize),
       serialize(reviewLine(current, request)),
     ]
-    if (promptBytes(appended) <= maxBytes) return prepared(previous.epoch, request.context, appended)
+    if (promptBytes(appended, reasoningTokens) <= maxBytes) {
+      return prepared(previous.epoch, request.context, appended, reasoningTokens)
+    }
   }
 
-  return startEpoch(previous?.epoch === undefined ? 0 : previous.epoch + 1, request, maxBytes)
+  return startEpoch(previous?.epoch === undefined ? 0 : previous.epoch + 1, request, maxBytes, reasoningTokens)
 }
 
-function startEpoch(epoch: number, request: ReviewRequest, maxBytes: number): PreparedReviewJournal | undefined {
+function startEpoch(
+  epoch: number,
+  request: ReviewRequest,
+  maxBytes: number,
+  reasoningTokens: number,
+): PreparedReviewJournal | undefined {
   const current = request.context.at(-1)
   if (!current || current.type !== "tool") return
   const currentTool = current
   const historical = request.context.slice(0, -1)
   const selected = new Set<number>()
   const minimum = epochLines(epoch, request, historical, selected, currentTool)
-  const available = maxBytes - promptBytes(minimum)
+  const available = maxBytes - promptBytes(minimum, reasoningTokens)
   if (available < 0) return
 
   const remaining = {
@@ -63,7 +71,7 @@ function startEpoch(epoch: number, request: ReviewRequest, maxBytes: number): Pr
   addWithinBudget([...tools].reverse(), undefined)
 
   const lines = epochLines(epoch, request, historical, selected, currentTool)
-  return prepared(epoch, request.context, lines)
+  return prepared(epoch, request.context, lines, reasoningTokens)
 
   function addWithinBudget(indexes: readonly number[], category: keyof typeof remaining | undefined) {
     for (const index of indexes) {
@@ -71,7 +79,7 @@ function startEpoch(epoch: number, request: ReviewRequest, maxBytes: number): Pr
       const cost = lineBytes(serialize(historical[index]!))
       if (category && cost > remaining[category]) continue
       const next = new Set(selected).add(index)
-      if (promptBytes(epochLines(epoch, request, historical, next, currentTool)) > maxBytes) continue
+      if (promptBytes(epochLines(epoch, request, historical, next, currentTool), reasoningTokens) > maxBytes) continue
       selected.add(index)
       if (category) remaining[category] -= cost
     }
@@ -116,7 +124,12 @@ function reviewLine(current: Extract<ReviewContextEntry, { type: "tool" }>, requ
   }
 }
 
-function prepared(epoch: number, context: readonly ReviewContextEntry[], lines: string[]): PreparedReviewJournal {
+function prepared(
+  epoch: number,
+  context: readonly ReviewContextEntry[],
+  lines: string[],
+  reasoningTokens: number,
+): PreparedReviewJournal {
   const state = {
     version: 2 as const,
     epoch,
@@ -124,7 +137,7 @@ function prepared(epoch: number, context: readonly ReviewContextEntry[], lines: 
     sourceDigest: digest(context),
     lines,
   }
-  return { ...state, prompt: buildReviewPrompt(lines) }
+  return { ...state, prompt: buildReviewPrompt(lines, reasoningTokens) }
 }
 
 function readState(value: unknown): ReviewerJournalState | undefined {
@@ -149,8 +162,8 @@ function category(entry: ReviewContextEntry): "users" | "tools" | "compactions" 
   return "compactions"
 }
 
-function promptBytes(lines: readonly string[]): number {
-  return Buffer.byteLength(buildReviewPrompt(lines), "utf8")
+function promptBytes(lines: readonly string[], reasoningTokens: number): number {
+  return Buffer.byteLength(buildReviewPrompt(lines, reasoningTokens), "utf8")
 }
 
 function lineBytes(line: string): number {
