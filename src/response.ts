@@ -1,24 +1,14 @@
 import type { ReviewDecision } from "./types.js"
 
-const DECISIONS = new Set(["allow", "deny"])
+const DECISIONS = new Set(["allow", "deny", "ask"])
 const RISKS = new Set(["low", "medium", "high", "critical", "unknown"])
 const AUTHORIZATIONS = new Set(["high", "medium", "low", "unknown"])
 const MAX_REASON_BYTES = 2048
 const MAX_RULES = 16
 const MAX_RULE_BYTES = 64
 
-export function parseFastReviewResponse(text: string): "allow" | "review" | undefined {
-  let value: unknown
-  try {
-    value = new StrictJsonParser(text.trim()).parse()
-  } catch {
-    return
-  }
-  if (!isRecord(value) || Object.keys(value).length !== 1) return
-  return value.decision === "allow" || value.decision === "review" ? value.decision : undefined
-}
-
 export function parseReviewResponse(text: string): ReviewDecision | undefined {
+  if (Buffer.byteLength(text, "utf8") > 16_384) return
   const trimmed = text.trim()
   if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return
 
@@ -45,12 +35,11 @@ export function parseReviewResponse(text: string): ReviewDecision | undefined {
   if (value.matched_rules.some((rule) => typeof rule !== "string" || rule === "" || Buffer.byteLength(rule, "utf8") > MAX_RULE_BYTES)) return
 
   const inconsistentAllow = value.decision === "allow" &&
-    (value.risk !== "low" || !["high", "medium"].includes(value.authorization as string))
-  const decision = inconsistentAllow ? "deny" : value.decision as ReviewDecision["decision"]
-  const reason = inconsistentAllow
-    ? "The reviewer response conflicts with the safety decision matrix"
-    : value.reason
-  if ((decision === "deny" || (decision === "allow" && value.authorization === "medium")) &&
+    (!["low", "medium"].includes(value.risk as string) || !["high", "medium"].includes(value.authorization as string))
+  if (inconsistentAllow) return
+  const decision = value.decision as ReviewDecision["decision"]
+  const reason = value.reason
+  if ((decision !== "allow" || (decision === "allow" && value.authorization === "medium")) &&
     typeof reason !== "string") return
 
   return {
@@ -66,7 +55,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-class StrictJsonParser {
+export class StrictJsonParser {
   #index = 0
 
   constructor(readonly text: string) {}

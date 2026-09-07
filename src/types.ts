@@ -15,6 +15,7 @@ export interface PermissionEvent {
 }
 
 export interface ReviewRequest {
+  checkpoint?: string
   context: ReviewContextEntry[]
   history_truncated: boolean
   permission: {
@@ -29,7 +30,7 @@ export type ReviewContextEntry =
   | { type: "compaction"; summary: string; recent: string }
 
 export interface ReviewDecision {
-  decision: "allow" | "deny"
+  decision: "allow" | "deny" | "ask"
   risk: "low" | "medium" | "high" | "critical" | "unknown"
   authorization: "high" | "medium" | "low" | "unknown"
   reason?: string
@@ -37,6 +38,7 @@ export interface ReviewDecision {
 }
 
 export interface ReviewerJournalState {
+  checkpoint?: string
   version: 2
   epoch: number
   sourceLength: number

@@ -33,7 +33,7 @@ export default Plugin.define({
             const action = await ctx.ui.dialog.select({
               title: "Auto-review mode",
               options: [
-                { title: "Enable", value: "on", description: "Automatically allow or deny eligible tool requests" },
+                { title: "Enable", value: "on", description: "Review eligible requests; ask when evidence or confirmation is needed" },
                 { title: "Disable", value: "off", description: "Use normal OpenCode permission handling" },
                 { title: "Show status", value: "status" },
               ],

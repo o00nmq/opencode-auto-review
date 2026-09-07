@@ -1,20 +1,16 @@
 # OpenCode Auto Review
 
-Automatically reviews selected **OpenCode V2** permission prompts. Safe requests can proceed without a human prompt; unsafe or unverifiable requests are denied.
-
-This plugin is not a sandbox. Keep appropriate OpenCode permissions and system isolation in place.
-
-OpenCode V1 is not supported. Its plugin API is incompatible; use OpenCode V2 to load this plugin.
+Automatically reviews **OpenCode V2** permission prompts. Authorized, low-risk operations can proceed automatically; unsafe operations are denied; uncertain requests go to you for confirmation.
 
 ## Install
-
-Install the plugin globally:
 
 ```sh
 opencode2 plugin add opencode-auto-review
 ```
 
-To select a reviewer model or change other options, edit the plugin entry in `opencode.json(c)`:
+## Configure
+
+Choose a reviewer model in `opencode.json(c)`. Replace the example with an available model; `#variant` is optional.
 
 ```jsonc
 {
@@ -23,35 +19,22 @@ To select a reviewer model or change other options, edit the plugin entry in `op
     {
       "package": "opencode-auto-review",
       "options": {
-        "model": "provider/model"
+        "model": "provider/model#variant"
       }
     }
   ]
 }
 ```
 
-The `model` option is optional. Without it, the plugin uses the `auto-reviewer` agent model or the current OpenCode default model.
+The model is optional: the plugin falls back to the `auto-reviewer` agent's model, then OpenCode's default.
 
-Options and defaults:
-
-- `enabled`: `true`
-- `agent`: `"auto-reviewer"`
-- `model`: unset; uses the agent model or current OpenCode default model
-- `fastTimeoutMs`: `30000`
-- `timeoutMs`: `150000`
-- `maxReviewTokens`: `4096`
-- `maxReviewBytes`: `65536`
-- `maxConcurrentReviews`: `3`
-- `maxQueuedReviews`: `32`
-- `actions`: `["read", "edit", "glob", "grep", "shell", "webfetch", "websearch", "external_directory"]`
-- `humanReviewRules`: `[]`
-- `debug`: `false`
+Automatic review is enabled by default, with **2,048 output tokens** and **90 seconds total per request**. Change these with `maxReviewTokens` and `timeoutMs`. The default output parameter targets Chat Completions; see [advanced configuration](DESIGN.md#configuration) for other APIs and human-only rules.
 
 ## Usage
 
-Use `/auto-review on`, `/auto-review off`, `/auto-review toggle`, or `/auto-review status`. The TUI also provides **Toggle Auto-review** in the command palette and displays `Auto Mode` while enabled.
+Use `/auto-review on`, `/auto-review off`, `/auto-review toggle`, or `/auto-review status`. The command palette also provides **Toggle Auto-review**.
 
-The plugin reviews only eligible tool requests whose current permission effect is `ask`. Existing `allow` and `deny` rules are not overridden. Obvious low-risk requests use a fast review; uncertain requests receive a deeper review. If both stages time out, the original permission prompt is returned to the user. Reviewer context is bounded and excludes assistant reasoning, tool results, attachments, skills, synthetic messages, and prior reviewer decisions.
+The plugin handles eligible requests that would otherwise ask for permission. It can consult earlier user instructions and tool results when needed, including after the main conversation is compacted. Its feedback is limited to permission and safety decisions.
 
 ## Development
 
@@ -61,11 +44,13 @@ npm run check
 npm test
 ```
 
-Run an optional live test with:
+Optional live verification:
 
 ```sh
 AUTO_REVIEW_SMOKE_MODEL=provider/model npm run test:smoke
 ```
+
+See [DESIGN.md](DESIGN.md) for the review architecture and further verification scenarios.
 
 ## License
 

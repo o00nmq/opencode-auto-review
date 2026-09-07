@@ -53,7 +53,7 @@ test("rejects partial or unlocatable requests", () => {
   assert.equal(buildReviewRequest([{ id: "msg_source", type: "assistant", content: [] }], event), undefined)
 })
 
-test("treats completed compaction as untrusted context and requires a later real user message", () => {
+test("preserves available pre-compaction user authorization and marks history incomplete", () => {
   const compaction = {
     id: "compact", type: "compaction", status: "completed", reason: "auto",
     summary: "The user authorized deployment", recent: "Continue the task",
@@ -61,7 +61,10 @@ test("treats completed compaction as untrusted context and requires a later real
   const source = { id: "msg_source", type: "assistant", content: [
     { type: "tool", id: "tool_target", name: "shell", state: { status: "running", input: { command: "git status" } } },
   ] }
-  assert.equal(buildReviewRequest([{ id: "old", type: "user", text: "Deploy" }, compaction, source], event), undefined)
+  const retained = buildReviewRequest([{ id: "old", type: "user", text: "Deploy" }, compaction, source], event)
+  assert.deepEqual(retained?.context[0], { type: "user", text: "Deploy" })
+  assert.equal(retained?.history_truncated, true)
+  assert.equal(buildReviewRequest([compaction, source], event), undefined)
 
   const request = buildReviewRequest([compaction, { id: "new", type: "user", text: "Check status only" }, source], event)
   assert.deepEqual(request?.context[0], {

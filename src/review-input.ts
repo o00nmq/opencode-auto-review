@@ -26,7 +26,7 @@ export function buildReviewRequest(
 
   const compactionIndex = findLatestCompaction(messages, sourceIndex)
   if (compactionIndex !== undefined && (messages[compactionIndex] as Record<string, unknown>).status === "running") return
-  const startIndex = compactionIndex ?? 0
+  const startIndex = 0
   const history: ReviewContextEntry[] = []
   let hasUser = false
 
@@ -52,8 +52,10 @@ export function buildReviewRequest(
   if (!hasUser) return
 
   return {
-    context: [...history, { type: "tool", name: currentTool.name, input: currentTool.input }],
-    history_truncated: false,
+    ...(compactionIndex !== undefined && typeof (messages[compactionIndex] as MessageInfo).id === "string"
+      ? { checkpoint: (messages[compactionIndex] as MessageInfo).id! } : {}),
+    context: structuredClone([...history, { type: "tool" as const, name: currentTool.name, input: currentTool.input }]),
+    history_truncated: compactionIndex !== undefined,
     permission: { action: event.action, resources: [...event.resources] },
   }
 

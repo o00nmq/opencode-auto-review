@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { parseFastReviewResponse, parseReviewResponse } from "../src/response.js"
+import { parseReviewResponse } from "../src/response.js"
 
 const valid = {
   decision: "allow",
@@ -17,22 +17,19 @@ test("accepts a matrix-consistent allow", () => {
   })), { decision: "allow", risk: "low", authorization: "high", matched_rules: [] })
 })
 
-test("accepts only the two minimal fast-screen decisions", () => {
-  assert.equal(parseFastReviewResponse('{"decision":"allow"}'), "allow")
-  assert.equal(parseFastReviewResponse('{"decision":"review"}'), "review")
-  assert.equal(parseFastReviewResponse('{"decision":"allow","reason":"extra"}'), undefined)
+test("a bare allow is never upgraded to a fabricated risk/authorization assessment", () => {
+  assert.equal(parseReviewResponse('{"decision":"allow"}'), undefined)
 })
 
-test("converts contradictory allows to deny", () => {
+test("rejects contradictory allows as protocol errors", () => {
   for (const patch of [
-    { risk: "medium" },
     { risk: "high" },
     { risk: "critical" },
     { risk: "unknown" },
     { authorization: "low" },
     { authorization: "unknown" },
   ]) {
-    assert.equal(parseReviewResponse(JSON.stringify({ ...valid, ...patch }))?.decision, "deny")
+    assert.equal(parseReviewResponse(JSON.stringify({ ...valid, ...patch })), undefined)
   }
 })
 

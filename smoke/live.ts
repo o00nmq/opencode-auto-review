@@ -3,30 +3,41 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { spawnSync } from "node:child_process"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 
 const marker = "AUTO_REVIEW_LIVE_7F3A91"
-const root = mkdtempSync(join(tmpdir(), "opencode-auto-review-"))
+const tempRoot = join(tmpdir(), "opencode")
+mkdirSync(tempRoot, { recursive: true })
+const root = mkdtempSync(join(tempRoot, "auto-review-"))
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const pluginPath = process.env.AUTO_REVIEW_PLUGIN_PATH ?? join(packageRoot, "src/index.ts")
 const configuredModel = process.env.AUTO_REVIEW_SMOKE_MODEL
 if (!configuredModel) throw new Error("Set AUTO_REVIEW_SMOKE_MODEL=provider/model to run live smoke tests")
 const model: string = configuredModel
+console.log(`Live smoke artifacts: ${root}`)
+const candidate = join(root, "candidate")
+mkdirSync(candidate)
+writeFileSync(join(candidate, "package.json"), JSON.stringify({ name: "auto-review-smoke-candidate", type: "module", exports: "./index.ts" }))
+// Use a distinct fixture ID so a globally installed release cannot shadow the candidate.
+writeFileSync(join(candidate, "index.ts"), `import plugin from ${JSON.stringify(pathToFileURL(pluginPath).href)}\nexport default { ...plugin, id: "auto-review-smoke-candidate" }\n`)
 
 function project(name: string, plugin: "none" | "review" | "human"): string {
   const directory = join(root, name)
   mkdirSync(directory, { recursive: true })
   writeFileSync(join(directory, "fixture.txt"), `${marker}\n`)
-  const plugins = plugin === "none" ? [] : plugin === "review" ? [pluginPath] : [{
-    package: pluginPath,
+  const plugins: unknown[] = ["-opencode-auto-review"]
+  if (plugin !== "none") plugins.push({
+    package: candidate,
     options: {
-      humanReviewRules: [{
+      model,
+      debug: true,
+      humanReviewRules: plugin === "human" ? [{
         action: "read",
         resource: "*",
-        reason: "Live smoke policy denies this read",
-      }],
+        reason: "Live smoke requires human confirmation for this read",
+      }] : [],
     },
-  }]
+  })
   writeFileSync(join(directory, "opencode.json"), JSON.stringify({
     $schema: "https://opencode.ai/config.json",
     model,
@@ -59,11 +70,13 @@ function run(directory: string) {
     timeout: 120_000,
   })
   if (result.error) throw result.error
-  return { status: result.status, output: `${result.stdout}${result.stderr}` }
+  const captured = { status: result.status, output: `${result.stdout}${result.stderr}` }
+  writeFileSync(join(directory, "run.json"), JSON.stringify(captured, null, 2))
+  return captured
 }
 
 const baseline = run(project("baseline", "none"))
-assert.notEqual(baseline.status, 0, "an unresolved ask must not execute in non-interactive mode")
+assert.doesNotMatch(baseline.output, new RegExp(marker), "an unresolved ask must not read the fixture")
 assert.match(baseline.output, /permission requested: read/)
 
 const reviewed = run(project("reviewed", "review"))
@@ -72,8 +85,7 @@ assert.match(reviewed.output, new RegExp(marker))
 assert.doesNotMatch(reviewed.output, /permission requested: read/)
 
 const human = run(project("human", "human"))
-assert.doesNotMatch(human.output, /permission requested: read/)
-assert.match(human.output, /Live smoke policy denies this read/)
+assert.match(human.output, /permission requested: read/)
 assert.doesNotMatch(human.output, new RegExp(marker))
 
 console.log(`Live smoke passed with ${model}`)

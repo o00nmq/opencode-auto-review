@@ -1,6 +1,8 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { prepareReviewJournal } from "../src/reviewer-journal.js"
+import { buildReviewPrompt } from "../src/policy.js"
+import { estimateTokens } from "../src/context-budget.js"
 import type { ReviewRequest } from "../src/types.js"
 
 function request(context: ReviewRequest["context"]): ReviewRequest {
@@ -39,14 +41,15 @@ test("history discontinuity or capacity starts a new bounded epoch", () => {
     { type: "user", text: "Inspect files" },
     { type: "tool", name: "read", input: { path: "a.ts" } },
   ])
-  const capacityFirst = prepareReviewJournal(undefined, firstRequest, 4_850)!
+  const budget = estimateTokens(buildReviewPrompt([])) + 500
+  const capacityFirst = prepareReviewJournal(undefined, firstRequest, budget)!
   const capacitySecond = prepareReviewJournal(capacityFirst, request([
     ...firstRequest.context,
     { type: "tool", name: "read", input: { path: "b.ts", note: "x".repeat(1_000) } },
-  ]), 4_850)!
+  ]), budget)!
 
   assert.equal(capacitySecond.epoch, 1)
-  assert.ok(Buffer.byteLength(capacitySecond.prompt, "utf8") <= 4_850)
+  assert.ok(estimateTokens(capacitySecond.prompt) <= budget)
   assert.equal(capacitySecond.prompt.startsWith(`${capacityFirst.prompt}\n`), false)
 })
 
@@ -57,7 +60,7 @@ test("new epochs anchor first and latest users before other history", () => {
     { type: "user", text: `MIDDLE_${"m".repeat(500)}` },
     { type: "user", text: "LATEST_REQUEST" },
     { type: "tool", name: "read", input: { path: "a.ts" } },
-  ]), 3_900)!
+  ]), estimateTokens(buildReviewPrompt([])) + 200)!
 
   assert.match(prepared.prompt, /FIRST_CONSTRAINT/)
   assert.match(prepared.prompt, /LATEST_REQUEST/)
@@ -65,16 +68,17 @@ test("new epochs anchor first and latest users before other history", () => {
   assert.match(prepared.lines[0]!, /"users":1/)
 })
 
-test("the byte limit covers fixed policy, framing, and the exact current action", () => {
+test("the token estimate covers fixed policy, framing, and the exact current action", () => {
   const input = request([
     { type: "user", text: "Inspect it" },
     { type: "tool", name: "read", input: { path: "a.ts" } },
   ])
-  const prepared = prepareReviewJournal(undefined, input, 3_800)!
-  assert.ok(Buffer.byteLength(prepared.prompt, "utf8") <= 3_800)
-  assert.equal(prepareReviewJournal(undefined, input, 3_700), undefined)
+  const budget = estimateTokens(buildReviewPrompt([])) + 200
+  const prepared = prepareReviewJournal(undefined, input, budget)!
+  assert.ok(estimateTokens(prepared.prompt) <= budget)
+  assert.equal(prepareReviewJournal(undefined, input, budget - 150), undefined)
   assert.equal(prepareReviewJournal(undefined, request([
     { type: "user", text: "Inspect it" },
     { type: "tool", name: "read", input: { path: "x".repeat(2_000) } },
-  ]), 5_000), undefined)
+  ]), budget), undefined)
 })

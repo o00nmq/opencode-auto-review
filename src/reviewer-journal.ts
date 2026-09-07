@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
-import { buildReviewPrompt } from "./policy.js"
+import { buildReviewPrompt, DEFAULT_OPTIONS } from "./policy.js"
 import type { ReviewContextEntry, ReviewerJournalState, ReviewRequest } from "./types.js"
+import { estimateTokens } from "./context-budget.js"
 
 const USER_BUDGET_SHARE = 0.6
 const TOOL_BUDGET_SHARE = 0.3
@@ -13,33 +14,33 @@ export interface PreparedReviewJournal extends ReviewerJournalState {
 export function prepareReviewJournal(
   stored: unknown,
   request: ReviewRequest,
-  maxBytes: number,
-  reasoningTokens = 4_096,
+  maxInputTokens: number,
+  reasoningTokens = DEFAULT_OPTIONS.maxReviewTokens,
 ): PreparedReviewJournal | undefined {
   const previous = readState(stored)
   const historical = request.context.slice(0, -1)
   const current = request.context.at(-1)
   if (!current || current.type !== "tool") return
 
-  if (previous && previous.sourceLength <= historical.length &&
+  if (previous && previous.checkpoint === request.checkpoint && previous.sourceLength <= historical.length &&
     digest(request.context.slice(0, previous.sourceLength)) === previous.sourceDigest) {
     const appended = [
       ...previous.lines,
       ...historical.slice(previous.sourceLength).map(serialize),
       serialize(reviewLine(current, request)),
     ]
-    if (promptBytes(appended, reasoningTokens) <= maxBytes) {
-      return prepared(previous.epoch, request.context, appended, reasoningTokens)
+    if (promptTokens(appended, reasoningTokens) <= maxInputTokens) {
+      return prepared(previous.epoch, request.context, appended, reasoningTokens, request.checkpoint)
     }
   }
 
-  return startEpoch(previous?.epoch === undefined ? 0 : previous.epoch + 1, request, maxBytes, reasoningTokens)
+  return startEpoch(previous?.epoch === undefined ? 0 : previous.epoch + 1, request, maxInputTokens, reasoningTokens)
 }
 
 function startEpoch(
   epoch: number,
   request: ReviewRequest,
-  maxBytes: number,
+  maxInputTokens: number,
   reasoningTokens: number,
 ): PreparedReviewJournal | undefined {
   const current = request.context.at(-1)
@@ -48,7 +49,7 @@ function startEpoch(
   const historical = request.context.slice(0, -1)
   const selected = new Set<number>()
   const minimum = epochLines(epoch, request, historical, selected, currentTool)
-  const available = maxBytes - promptBytes(minimum, reasoningTokens)
+  const available = maxInputTokens - promptTokens(minimum, reasoningTokens)
   if (available < 0) return
 
   const remaining = {
@@ -71,15 +72,15 @@ function startEpoch(
   addWithinBudget([...tools].reverse(), undefined)
 
   const lines = epochLines(epoch, request, historical, selected, currentTool)
-  return prepared(epoch, request.context, lines, reasoningTokens)
+  return prepared(epoch, request.context, lines, reasoningTokens, request.checkpoint)
 
   function addWithinBudget(indexes: readonly number[], category: keyof typeof remaining | undefined) {
     for (const index of indexes) {
       if (selected.has(index)) continue
-      const cost = lineBytes(serialize(historical[index]!))
+      const cost = estimateTokens(serialize(historical[index]!))
       if (category && cost > remaining[category]) continue
       const next = new Set(selected).add(index)
-      if (promptBytes(epochLines(epoch, request, historical, next, currentTool), reasoningTokens) > maxBytes) continue
+      if (promptTokens(epochLines(epoch, request, historical, next, currentTool), reasoningTokens) > maxInputTokens) continue
       selected.add(index)
       if (category) remaining[category] -= cost
     }
@@ -129,8 +130,10 @@ function prepared(
   context: readonly ReviewContextEntry[],
   lines: string[],
   reasoningTokens: number,
+  checkpoint?: string,
 ): PreparedReviewJournal {
   const state = {
+    ...(checkpoint ? { checkpoint } : {}),
     version: 2 as const,
     epoch,
     sourceLength: context.length,
@@ -162,12 +165,8 @@ function category(entry: ReviewContextEntry): "users" | "tools" | "compactions" 
   return "compactions"
 }
 
-function promptBytes(lines: readonly string[], reasoningTokens: number): number {
-  return Buffer.byteLength(buildReviewPrompt(lines, reasoningTokens), "utf8")
-}
-
-function lineBytes(line: string): number {
-  return Buffer.byteLength(`\n${line}`, "utf8")
+function promptTokens(lines: readonly string[], reasoningTokens: number): number {
+  return estimateTokens(buildReviewPrompt(lines, reasoningTokens))
 }
 
 function digest(value: unknown): string {

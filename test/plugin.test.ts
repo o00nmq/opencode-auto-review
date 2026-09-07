@@ -13,7 +13,7 @@ const denyText = JSON.stringify({
   decision: "deny",
   risk: "high",
   authorization: "low",
-  reason: "The command may expose environment secrets; inspect only the specific non-secret configuration needed for the task",
+  reason: "The command may expose environment secrets that the user has not authorized accessing",
   matched_rules: ["secret-access"],
 })
 
@@ -25,16 +25,15 @@ const mediumText = JSON.stringify({
   matched_rules: [],
 })
 
-const fastAllowText = JSON.stringify({ decision: "allow" })
-const fastReviewText = JSON.stringify({ decision: "review" })
-
 function createHarness(
   options: Record<string, unknown> = {},
   generate: string | ((input: any, options: { signal?: AbortSignal }) => Promise<{ text: string }>) = allowText,
   context?: () => Promise<any[]>,
+  catalogOverride?: unknown,
 ) {
   let evaluate: ((event: any) => Promise<void>) | undefined
   let command: ((input: any) => Promise<void>) | undefined
+  let onPrompt: ((event: any) => void) | undefined
   let generateCalls = 0
   let contextCalls = 0
   let disposed = 0
@@ -51,8 +50,29 @@ function createHarness(
   ]
   const pluginOptions: Record<string, unknown> = { model: "test/reviewer", ...options }
   if (options.model === null) delete pluginOptions.model
+  const catalogModel: any = { providerID: "test", id: "reviewer", limit: { context: 128_000, input: 120_000, output: 8192 }, variants: [
+    { id: "max", settings: { reasoningEffort: "high" }, body: { reasoning: { effort: "high" } } },
+  ] }
+  const defaultCatalog = {
+    model: {
+      default: async () => ({ data: catalogModel }),
+      list: async () => ({ data: [catalogModel] }),
+    },
+    transform: async (callback: (editor: any) => void) => {
+      const before = structuredClone(catalogModel.variants)
+      callback({ model: {
+        get: (provider: string, id: string) => provider === catalogModel.providerID && id === catalogModel.id ? catalogModel : undefined,
+        update: (_provider: string, _id: string, update: (draft: any) => void) => update(catalogModel),
+      } })
+      return { dispose: async () => { catalogModel.variants = before } }
+    },
+  }
   const ctx = {
     options: pluginOptions,
+    storage: (() => {
+      const entries = new Map<string, any>()
+      return { get: async (key: string) => structuredClone(entries.get(key)), set: async (key: string, value: any) => { entries.set(key, structuredClone(value)) } }
+    })(),
     permission: {
       hook: async (_name: string, callback: typeof evaluate) => {
         evaluate = callback
@@ -69,6 +89,10 @@ function createHarness(
       },
     },
     session: {
+      hook: async (_name: string, callback: typeof onPrompt) => {
+        if (_name === "prompt") onPrompt = callback
+        return { dispose: async () => undefined }
+      },
       context: async () => { contextCalls++; return context ? context() : messages },
       synthetic: async ({ text, description }: { text: string; description: string }) => {
         synthetic.push(text)
@@ -80,11 +104,10 @@ function createHarness(
       generatedPrompts.push(input.prompt)
       generationSignal = requestOptions.signal
       if (typeof generate === "function") return generate(input, requestOptions)
-      const fast = input.prompt.includes("fast conservative screen")
-      return { text: fast ? (generate === allowText ? fastAllowText : fastReviewText) : generate }
+      return { text: generate }
     } },
     agent: { get: async () => { throw new Error("missing") } },
-    catalog: { model: { default: async () => ({ data: { providerID: "test", id: "reviewer" } }) } },
+    catalog: catalogOverride ?? defaultCatalog,
   }
   return {
     async setup() {
@@ -116,20 +139,24 @@ function createHarness(
     messages,
     generationSignal: () => generationSignal,
     generatedPrompts: () => generatedPrompts,
+    admitPrompt: (sessionID: string) => onPrompt!({ sessionID }),
+    catalogModel,
   }
 }
 
 test("only a valid eligible ask can be auto-allowed", async () => {
   const harness = createHarness()
   const cleanup = await harness.setup()
-  assert.equal((await harness.run()).effect, "allow")
-  assert.equal(harness.visibleStatus(), "Auto-review approved: read.")
+  const event = await harness.run()
+  assert.equal(event.effect, "allow")
+  assert.equal((event as any).message, "Auto-review approved: read.")
+  assert.equal(harness.visibleStatus(), undefined)
   assert.deepEqual(harness.counts(), { generateCalls: 1, contextCalls: 1, disposed: 0 })
   await cleanup?.()
   assert.equal(harness.counts().disposed, 1)
 })
 
-test("reuses a hidden append-only pseudo-reviewer per main session", async () => {
+test("retains prior review outcomes per main session", async () => {
   const harness = createHarness()
   await harness.setup()
   await harness.run()
@@ -141,15 +168,15 @@ test("reuses a hidden append-only pseudo-reviewer per main session", async () =>
   const prompts = harness.generatedPrompts()
   assert.equal(prompts.length, 2)
   assert.ok(prompts[1]!.startsWith(`${prompts[0]!}\n`))
-  assert.doesNotMatch(prompts[1]!, /Narrow read|review_outcome/)
+  assert.match(prompts[1]!, /"type":"review_outcome","code":"allow"/)
 })
 
-test("denial returns detailed guidance in the tool error", async () => {
+test("denial returns its permission reason in the tool error", async () => {
   const harness = createHarness({}, denyText)
   await harness.setup()
   const event = await harness.run()
   assert.equal(event.effect, "deny")
-  assert.match((event as any).message, /specific non-secret configuration/)
+  assert.match((event as any).message, /not authorized accessing/)
   assert.match((event as any).message, /shell expansion/)
   assert.equal(harness.visibleStatus(), undefined)
 })
@@ -159,7 +186,8 @@ test("medium authorization is allowed and shows its rationale", async () => {
   await harness.setup()
   const event = await harness.run()
   assert.equal(event.effect, "allow")
-  assert.equal(harness.visibleStatus(), "Auto-review approved: Relevant but not explicitly authorized")
+  assert.equal((event as any).message, "Auto-review approved: Relevant but not explicitly authorized")
+  assert.equal(harness.visibleStatus(), undefined)
 })
 
 test("runtime command toggles auto-review without restarting", async () => {
@@ -183,32 +211,33 @@ test("configured allow and unknown actions do not call the reviewer", async () =
   assert.deepEqual(harness.counts(), { generateCalls: 0, contextCalls: 0, disposed: 0 })
 })
 
-test("human rules deny in auto mode while reviewer recursion remains ask", async () => {
+test("human rules preserve confirmation while reviewer recursion remains ask", async () => {
   const harness = createHarness({
     agent: "auto-reviewer",
     humanReviewRules: [{ action: "shell", resource: "git push *", reason: "Remote changes require confirmation" }],
   })
   await harness.setup()
   const human = await harness.run({ action: "shell", resources: ["git push origin main"] })
-  assert.equal(human.effect, "deny")
+  assert.equal(human.effect, "ask")
   assert.match((human as any).message, /Remote changes require confirmation/)
   assert.equal((await harness.run({ agent: "auto-reviewer" })).effect, "ask")
   assert.equal(harness.counts().generateCalls, 0)
 })
 
-test("malformed reviewer output fails closed to deny", async () => {
+test("malformed output exhausts bounded repair rounds and asks", async () => {
   const harness = createHarness({}, "not json")
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "deny")
-  assert.match((event as any).message, /did not return a complete valid decision/)
+  assert.equal(event.effect, "ask")
+  assert.match((event as any).message, /one format repair/)
+  assert.equal(harness.counts().generateCalls, 2)
 })
 
-test("provider errors fail closed to deny", async () => {
+test("provider errors preserve human confirmation", async () => {
   const harness = createHarness({}, async () => { throw new Error("provider secret") })
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "deny")
+  assert.equal(event.effect, "ask")
   assert.match((event as any).message, /did not return a complete valid decision/)
 })
 
@@ -220,43 +249,29 @@ test("missing reviewer agent uses the OpenCode default model", async () => {
   assert.equal(harness.counts().generateCalls, 1)
 })
 
-test("oversized complete input is denied without model disclosure", async () => {
-  const harness = createHarness({ maxReviewBytes: 1024 })
-  harness.messages[0].text = "x".repeat(2000)
+test("input budget follows current model limits and can exceed the old 64 KiB ceiling", async () => {
+  const harness = createHarness()
+  harness.catalogModel.limit = { context: 16_000, input: 8000, output: 8192 }
+  harness.messages[1].content[0].state.input = { path: "x".repeat(70_000) }
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "deny")
-  assert.match((event as any).message, /too large/)
+  assert.equal(event.effect, "ask")
+  assert.match((event as any).message, /model input budget/)
   assert.equal(harness.counts().generateCalls, 0)
+  harness.catalogModel.limit = { context: 256_000, input: 220_000, output: 8192 }
+  assert.equal((await harness.run()).effect, "allow")
+  assert.ok(Buffer.byteLength(harness.generatedPrompts()[0]!, "utf8") > 65_536)
 })
 
-test("two review timeouts abort both requests and return to user approval", async () => {
-  const harness = createHarness({ fastTimeoutMs: 1000, timeoutMs: 1000 }, () => new Promise(() => undefined))
+test("review deadline aborts even a provider that ignores cancellation", async () => {
+  const harness = createHarness({ timeoutMs: 1000 }, () => new Promise(() => undefined))
   await harness.setup()
   const started = Date.now()
   const event = await harness.run()
-  assert.ok(Date.now() - started >= 1900)
+  assert.ok(Date.now() - started >= 900)
   assert.equal(event.effect, "ask")
-  assert.equal(harness.counts().generateCalls, 2)
+  assert.equal(harness.counts().generateCalls, 1)
   assert.equal(harness.generationSignal()?.aborted, true)
-})
-
-test("only two timeouts return to user approval", async () => {
-  let calls = 0
-  const fastTimeout = createHarness({ fastTimeoutMs: 1000 }, async (_input, { signal }) => {
-    if (calls++ === 0) return aborts(signal!)
-    return { text: allowText }
-  })
-  await fastTimeout.setup()
-  assert.equal((await fastTimeout.run()).effect, "allow")
-
-  calls = 0
-  const deepTimeout = createHarness({ timeoutMs: 1000 }, async (_input, { signal }) => {
-    if (calls++ === 0) return { text: fastReviewText }
-    return aborts(signal!)
-  })
-  await deepTimeout.setup()
-  assert.equal((await deepTimeout.run()).effect, "deny")
 })
 
 test("cleanup prevents a late review from changing the event", async () => {
@@ -279,3 +294,139 @@ function aborts(signal: AbortSignal): Promise<never> {
     signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true })
   })
 }
+
+test("permission evaluation executes multiple evidence rounds before applying a verdict", async () => {
+  let round = 0
+  const harness = createHarness({}, async ({ prompt }) => {
+    round++
+    if (round === 1) {
+      assert.match(prompt, /"toolID":"prior-read"/)
+      return { text: JSON.stringify({ decision: "investigate", reason: "Check the script contents", requests: [
+        { type: "tool_result", messageID: "prior", toolID: "prior-read", offset: 0 },
+      ] }) }
+    }
+    if (round === 2) {
+      assert.match(prompt, /echo fixture-only/)
+      assert.match(prompt, /Check the script contents/)
+      return { text: JSON.stringify({ decision: "investigate", reason: "Verify user scope", requests: [
+        { type: "history", offset: 0 },
+      ] }) }
+    }
+    assert.equal(round, 3)
+    assert.match(prompt, /"type":"evidence","round":2/)
+    return { text: allowText }
+  })
+  harness.messages.splice(1, 0, { id: "prior", type: "assistant", content: [
+    { type: "tool", id: "prior-read", name: "read", state: {
+      status: "completed", input: { path: "script.sh" }, content: [{ type: "text", text: "echo fixture-only" }],
+    } },
+  ] })
+  await harness.setup()
+  assert.equal((await harness.run()).effect, "allow")
+  assert.equal(harness.counts().generateCalls, 3)
+})
+
+test("an explicit reviewer ask returns its question to the human", async () => {
+  const harness = createHarness({}, JSON.stringify({ decision: "ask", risk: "unknown", authorization: "unknown",
+    reason: "Confirm the target deployment environment", matched_rules: [] }))
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "ask")
+  assert.match((event as any).message, /Confirm the target deployment environment/)
+})
+
+test("turning auto-review off cancels active work and prevents late approval", async () => {
+  let resolve!: (value: { text: string }) => void
+  const harness = createHarness({}, () => new Promise((done) => { resolve = done }))
+  await harness.setup()
+  const pending = harness.run()
+  await new Promise((done) => setImmediate(done))
+  await harness.command("off")
+  resolve({ text: allowText })
+  assert.equal((await pending).effect, "ask")
+  assert.equal(harness.generationSignal()?.aborted, true)
+})
+
+test("new user input cancels only that session's outstanding review", async () => {
+  const harness = createHarness({}, (_input, { signal }) => aborts(signal!))
+  await harness.setup()
+  const pending = harness.run()
+  await new Promise((done) => setImmediate(done))
+  harness.admitPrompt("other-session")
+  assert.equal(harness.generationSignal()?.aborted, false)
+  harness.admitPrompt("ses_test")
+  assert.equal((await pending).effect, "ask")
+  assert.equal(harness.generationSignal()?.aborted, true)
+})
+
+test("a hung context read does not block the next same-session review after its deadline", async () => {
+  let hang = true
+  const harness = createHarness({ timeoutMs: 1000 }, allowText,
+    async () => hang ? new Promise(() => undefined) : harness.messages)
+  await harness.setup()
+  assert.equal((await harness.run()).effect, "ask")
+  hang = false
+  await new Promise((done) => setImmediate(done))
+  assert.equal((await harness.run()).effect, "allow")
+})
+
+test("independent sessions run concurrently while identical in-flight requests share one review", async () => {
+  let release!: (result: { text: string }) => void
+  const gate = new Promise<{ text: string }>((resolve) => { release = resolve })
+  const harness = createHarness({}, () => gate)
+  const cleanup = await harness.setup()
+  const pending = ["one", "one", "two", "three", "four", "five"].map(sessionID => harness.run({ sessionID }))
+  try {
+    await new Promise((done) => setImmediate(done))
+    assert.equal(harness.counts().generateCalls, 5)
+    assert.equal(harness.counts().contextCalls, 5)
+    release({ text: allowText })
+    assert.ok((await Promise.all(pending)).every(event => event.effect === "allow"))
+  } finally {
+    release({ text: allowText })
+    await cleanup?.()
+  }
+})
+
+test("plugin modelOptions select a derived variant once across concurrent reviews and dispose it", async () => {
+  const selected: any = { providerID: "test", id: "reviewer", limit: { context: 128_000, output: 8192 }, variants: [], body: { max_tokens: 4096 } }
+  let registrations = 0
+  let disposals = 0
+  const catalog = {
+    transform: async (callback: (editor: any) => void) => {
+      registrations++
+      callback({ model: { get: () => selected, update: (_p: string, _m: string, update: (draft: any) => void) => update(selected) } })
+      return { dispose: async () => { disposals++; selected.variants = [] } }
+    },
+    model: { list: async () => ({ data: [selected] }) },
+  }
+  const harness = createHarness({ modelOptions: { body: { max_tokens: 512 } } }, async (input) => {
+    assert.equal(input.body, undefined, "unsupported generate fields must not be sent")
+    assert.equal(input.model.variant, selected.variants[0].id)
+    assert.equal(selected.variants[0].body.max_tokens, 512)
+    assert.equal(selected.body.max_tokens, 4096)
+    return { text: allowText }
+  }, undefined, catalog)
+  const cleanup = await harness.setup()
+  const results = await Promise.all([harness.run({ sessionID: "one" }), harness.run({ sessionID: "two" })])
+  assert.ok(results.every((event) => event.effect === "allow"))
+  assert.equal(registrations, 1)
+  await cleanup?.()
+  assert.equal(disposals, 1)
+  assert.deepEqual(selected.variants, [])
+})
+
+test("default Chat budget preserves the selected native reasoning variant", async () => {
+  const harness = createHarness({ model: "test/reviewer#max" }, async (input) => {
+    const variant = harness.catalogModel.variants.find((entry: any) => entry.id === input.model.variant)
+    assert.equal(variant.body.max_tokens, 2048)
+    assert.deepEqual(variant.settings, { reasoningEffort: "high" })
+    assert.deepEqual(variant.body.reasoning, { effort: "high" })
+    assert.equal(harness.catalogModel.variants[0].id, "max")
+    assert.equal(harness.catalogModel.variants[0].body.max_tokens, undefined)
+    return { text: allowText }
+  })
+  const cleanup = await harness.setup()
+  assert.equal((await harness.run()).effect, "allow")
+  await cleanup?.()
+})

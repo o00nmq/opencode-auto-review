@@ -29,7 +29,6 @@ test("the last matching human review rule wins", () => {
 test("options reject unsafe malformed configuration", () => {
   for (const options of [
     { timeoutMs: 2 },
-    { fastTimeoutMs: 2 },
     { actions: ["read", 3] },
     { model: "invalid" },
     { action: ["read"] },
@@ -41,8 +40,8 @@ test("options reject unsafe malformed configuration", () => {
     parseOptions({ model: "openrouter/anthropic/claude-sonnet-4.5#high" }).model,
     "openrouter/anthropic/claude-sonnet-4.5#high",
   )
-  assert.equal(parseOptions({ maxConcurrentReviews: 5 }).maxConcurrentReviews, 5)
-  assert.equal(parseOptions({ fastTimeoutMs: 4_000, timeoutMs: 8_000 }).fastTimeoutMs, 4_000)
+  assert.equal(parseOptions({}).timeoutMs, 90_000)
+  assert.equal(parseOptions({ timeoutMs: 8_000 }).timeoutMs, 8_000)
   assert.equal(parseOptions({ enabled: false }).enabled, false)
 })
 
