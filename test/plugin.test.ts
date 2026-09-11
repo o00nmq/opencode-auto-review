@@ -136,6 +136,7 @@ function createHarness(
     counts: () => ({ generateCalls, contextCalls, disposed }),
     commandDescription: () => commandDescription,
     visibleStatus: () => syntheticDescriptions.at(-1),
+    visibleMessages: () => synthetic.slice(),
     messages,
     generationSignal: () => generationSignal,
     generatedPrompts: () => generatedPrompts,
@@ -241,6 +242,9 @@ test("provider errors preserve human confirmation", async () => {
   assert.match((event as any).message, /reviewer model call failed/)
   assert.match((event as any).message, /provider secret/)
   assert.match((event as any).message, /not a safety judgment/)
+  // The failure must also be surfaced as a session notice, not silently applied.
+  assert.match(harness.visibleMessages().at(-1) ?? "", /Auto-review fallback on read/)
+  assert.match(harness.visibleMessages().at(-1) ?? "", /provider secret/)
 })
 
 test("missing reviewer agent uses the OpenCode default model", async () => {
@@ -253,6 +257,7 @@ test("missing reviewer agent uses the OpenCode default model", async () => {
   assert.match((event as any).message, /auto-review fallback/)
   assert.match((event as any).message, /reviewer agent lookup failed: missing/)
   assert.match((event as any).message, /catalog default model test\/reviewer/)
+  assert.match(harness.visibleMessages().at(-1) ?? "", /Auto-review fallback on read/)
 })
 
 test("an unavailable reviewer model asks with the registration failure instead of silently proceeding", async () => {
@@ -263,6 +268,7 @@ test("an unavailable reviewer model asks with the registration failure instead o
   assert.equal(harness.counts().generateCalls, 0)
   assert.match((event as any).message, /could not resolve a reviewer model/)
   assert.match((event as any).message, /test\/absent is not available/)
+  assert.match(harness.visibleMessages().at(-1) ?? "", /test\/absent is not available/)
 })
 
 test("a missing reviewer variant reports the registration failure", async () => {
@@ -272,6 +278,16 @@ test("a missing reviewer variant reports the registration failure", async () => 
   assert.equal(event.effect, "ask")
   assert.equal(harness.counts().generateCalls, 0)
   assert.match((event as any).message, /variant "missing" is not available/)
+  assert.match(harness.visibleMessages().at(-1) ?? "", /variant "missing" is not available/)
+})
+
+test("a clean reviewer ask does not emit a fallback notice", async () => {
+  const harness = createHarness({}, JSON.stringify({ decision: "ask", risk: "unknown", authorization: "unknown",
+    reason: "Confirm the deployment target", matched_rules: [] }))
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "ask")
+  assert.deepEqual(harness.visibleMessages(), [])
 })
 
 test("input budget follows current model limits and can exceed the old 64 KiB ceiling", async () => {

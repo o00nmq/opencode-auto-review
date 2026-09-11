@@ -100,6 +100,9 @@ export default Plugin.define({
         }
         diagnose({ action: event.action, request: key, outcome: outcome.code })
         const notices = outcome.notices ?? []
+        // Surface reviewer degradation as a session notice, not only inside the permission prompt.
+        const degraded = degradationReasons(outcome, notices)
+        if (degraded.length) await notify(event.sessionID, `Auto-review fallback on ${event.action}: ${degraded.join("; ")}`)
         if (outcome.decision?.decision === "allow") {
           event.effect = "allow"
           event.message = withNotices(outcome.decision.reason ? `Auto-review approved: ${outcome.decision.reason}` : `Auto-review approved: ${event.action}.`, notices)
@@ -250,6 +253,13 @@ export default Plugin.define({
       })
     }
 
+    /** Best-effort session notice; never let a notice failure change a permission decision. */
+    async function notify(sessionID: string, text: string): Promise<void> {
+      try {
+        await ctx.session.synthetic({ sessionID, text, description: text, delivery: "queue", resume: false })
+      } catch {}
+    }
+
     function denyPolicy(event: PermissionEvent, reason: string, notices: readonly string[] = []): void {
       event.effect = "deny"
       event.message = withNotices(denialMessage(reason), notices)
@@ -284,6 +294,15 @@ function denialMessage(reason: string): string {
 function withNotices(message: string, notices: readonly string[]): string {
   const unique = [...new Set(notices.map((notice) => notice.trim()).filter(Boolean))]
   return unique.length ? `${message} [auto-review fallback: ${unique.join("; ")}]` : message
+}
+
+/** Reasons the reviewer could not reach a verdict on its own, for user-visible surfacing. */
+function degradationReasons(outcome: ReviewOutcome, notices: readonly string[]): string[] {
+  const reasons = [...notices]
+  if (!outcome.decision && outcome.code !== "aborted") {
+    reasons.push(outcome.message?.trim() || `automatic review ended without a decision (${outcome.code})`)
+  }
+  return [...new Set(reasons.map((reason) => reason.trim()).filter(Boolean))]
 }
 
 function describeError(error: unknown): string {
