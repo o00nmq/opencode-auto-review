@@ -8,9 +8,13 @@ export interface ReviewOutcome {
   decision?: ReviewDecision
   message?: string
   code: string
+  /** Reviewer-side degradation to surface to the user instead of hiding it. */
+  notices?: string[]
 }
 
-interface StageResult { text?: string; timedOut: boolean }
+interface StageResult { text?: string; timedOut: boolean; error?: string }
+
+const REVIEW_FAILURE_NOTE = "This is not a safety judgment about the requested action. Human confirmation is required."
 
 /** Evidence-driven review: finish immediately when supported, investigate only as needed. */
 export async function runReviewLoop(input: {
@@ -58,7 +62,10 @@ export async function runReviewLoop(input: {
     if (Date.now() >= deadline) return unavailable("timeout", "Automatic review reached its deadline")
     if (!result.text) {
       input.onRound?.(round, result.timedOut ? "timeout" : "provider_failure")
-      return unavailable(result.timedOut ? "timeout" : "review_failure", "Automatic review did not return a complete valid decision")
+      if (result.timedOut) return unavailable("timeout", "Automatic review reached its deadline")
+      return unavailable("review_failure", result.error
+        ? `Automatic review could not complete because the reviewer model call failed (${result.error}). ${REVIEW_FAILURE_NOTE}`
+        : `Automatic review did not return a complete valid decision. ${REVIEW_FAILURE_NOTE}`)
     }
     // Validate before retaining model text; arbitrary output never becomes protocol.
     const decision = parseReviewResponse(result.text)

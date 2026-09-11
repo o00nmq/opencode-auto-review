@@ -26,15 +26,23 @@ export async function registerModelOptions(
   catalog: Plugin.Context["catalog"],
   model: ReviewerModel,
   options: ModelOptions,
-) {
+): Promise<{ model: ReviewerModel; dispose(): Promise<void> } | { error: string }> {
   const overrides = structuredClone(options)
   const id = `opencode-auto-review-${createHash("sha256").update(JSON.stringify([model, overrides])).digest("hex").slice(0, 16)}` as Model.Variant["id"]
+  let reason: string | undefined
+  let applied = false
   const registration = await catalog.transform((editor) => {
     const original = editor.model.get(model.providerID, model.id)
-    if (!original) return
+    if (!original) {
+      reason = `reviewer model ${model.providerID}/${model.id} is not available`
+      return
+    }
     const inherited = original.variants.find((variant) => String(variant.id) === model.variant)
     // An invalid selected variant must not silently fall back to the base model.
-    if (model.variant && !inherited) return
+    if (model.variant && !inherited) {
+      reason = `reviewer variant "${model.variant}" is not available for ${model.providerID}/${model.id}`
+      return
+    }
     editor.model.update(model.providerID, model.id, (draft) => {
       draft.variants = [
         ...draft.variants.filter((variant) => variant.id !== id),
@@ -46,7 +54,13 @@ export async function registerModelOptions(
         },
       ]
     })
+    applied = true
   })
+  // Returning an unregistered variant id would silently drop the requested overrides.
+  if (!applied) {
+    await registration.dispose()
+    return { error: reason ?? `reviewer model options for ${model.providerID}/${model.id} could not be applied` }
+  }
   return { model: { ...model, variant: id }, dispose: () => registration.dispose() }
 }
 

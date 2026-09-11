@@ -238,7 +238,9 @@ test("provider errors preserve human confirmation", async () => {
   await harness.setup()
   const event = await harness.run()
   assert.equal(event.effect, "ask")
-  assert.match((event as any).message, /did not return a complete valid decision/)
+  assert.match((event as any).message, /reviewer model call failed/)
+  assert.match((event as any).message, /provider secret/)
+  assert.match((event as any).message, /not a safety judgment/)
 })
 
 test("missing reviewer agent uses the OpenCode default model", async () => {
@@ -247,6 +249,29 @@ test("missing reviewer agent uses the OpenCode default model", async () => {
   const event = await harness.run()
   assert.equal(event.effect, "allow")
   assert.equal(harness.counts().generateCalls, 1)
+  // The fallback from agent lookup to the catalog default must be visible, not silent.
+  assert.match((event as any).message, /auto-review fallback/)
+  assert.match((event as any).message, /reviewer agent lookup failed: missing/)
+  assert.match((event as any).message, /catalog default model test\/reviewer/)
+})
+
+test("an unavailable reviewer model asks with the registration failure instead of silently proceeding", async () => {
+  const harness = createHarness({ model: "test/absent" })
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "ask")
+  assert.equal(harness.counts().generateCalls, 0)
+  assert.match((event as any).message, /could not resolve a reviewer model/)
+  assert.match((event as any).message, /test\/absent is not available/)
+})
+
+test("a missing reviewer variant reports the registration failure", async () => {
+  const harness = createHarness({ model: "test/reviewer#missing" })
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "ask")
+  assert.equal(harness.counts().generateCalls, 0)
+  assert.match((event as any).message, /variant "missing" is not available/)
 })
 
 test("input budget follows current model limits and can exceed the old 64 KiB ceiling", async () => {

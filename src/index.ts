@@ -24,7 +24,8 @@ export default Plugin.define({
     const options = parseOptions(ctx.options)
     let enabled = options.enabled
     let model: ReviewerModel | undefined
-    let pendingModel: Promise<ReviewerModel | undefined> | undefined
+    let modelNotices: string[] = []
+    let pendingModel: Promise<{ model: ReviewerModel | undefined; notices: string[] }> | undefined
     const modelController = new AbortController()
     let modelRegistration: { dispose(): Promise<void> } | undefined
     const inFlight = new Map<string, Promise<ReviewOutcome>>()
@@ -98,13 +99,14 @@ export default Plugin.define({
           return
         }
         diagnose({ action: event.action, request: key, outcome: outcome.code })
+        const notices = outcome.notices ?? []
         if (outcome.decision?.decision === "allow") {
           event.effect = "allow"
-          event.message = outcome.decision.reason ? `Auto-review approved: ${outcome.decision.reason}` : `Auto-review approved: ${event.action}.`
+          event.message = withNotices(outcome.decision.reason ? `Auto-review approved: ${outcome.decision.reason}` : `Auto-review approved: ${event.action}.`, notices)
           return
         }
-        if (outcome.decision?.decision === "deny") denyPolicy(event as PermissionEvent, outcome.decision.reason ?? FAILURE_MESSAGE)
-        else askHuman(event as PermissionEvent, outcome.decision?.reason ?? outcome.message ?? REVIEWER_FAILURE_MESSAGE)
+        if (outcome.decision?.decision === "deny") denyPolicy(event as PermissionEvent, outcome.decision.reason ?? FAILURE_MESSAGE, notices)
+        else askHuman(event as PermissionEvent, outcome.decision?.reason ?? outcome.message ?? REVIEWER_FAILURE_MESSAGE, notices)
       } catch {
         if (!disposed) {
           diagnose({ action: event.action, outcome: controller.signal.aborted ? "aborted" : "failure" })
@@ -138,20 +140,25 @@ export default Plugin.define({
       signal: AbortSignal,
       deadline: number,
     ): Promise<ReviewOutcome | undefined> {
-      const selectedModel = await raceWithAbort(getModel(), signal)
-      if (!selectedModel || signal.aborted) return
+      const resolved = await raceWithAbort(getModel(), signal)
+      if (signal.aborted) return
+      const notices = resolved.notices
+      if (!resolved.model) {
+        return { code: "model_unavailable", message: "Automatic review could not resolve a reviewer model", notices }
+      }
+      const selectedModel = resolved.model
       const catalog = await raceWithAbort(ctx.catalog.model.list({}, { signal }), signal)
       const info = catalog.data.find((item) => item.providerID === selectedModel.providerID && item.id === selectedModel.id)
       const variant = info?.variants.find((item) => item.id === selectedModel.variant)
       const maxInputTokens = inputTokenBudget(info?.limit, { ...info?.body, ...variant?.body })
-      if (!maxInputTokens) return { code: "context_limit", message: "Reviewer model has no usable input budget after reserving output tokens" }
+      if (!maxInputTokens) return { code: "context_limit", message: "Reviewer model has no usable input budget after reserving output tokens", notices }
       const prepared = prepareReviewJournal(
         reviewerStates.get(sessionID),
         request,
         Math.floor(maxInputTokens * 0.75) - estimateTokens(JSON.stringify(evidence.index)),
         options.maxReviewTokens,
       )
-      if (!prepared) return { code: "context_limit", message: "The complete tool request is too large for the model input budget" }
+      if (!prepared) return { code: "context_limit", message: "The complete tool request is too large for the model input budget", notices }
       const { prompt: _prompt, ...state } = prepared
       const outcome = await runReviewLoop({
         lines: state.lines,
@@ -169,41 +176,48 @@ export default Plugin.define({
         // Bound retained session state. Eviction rebuilds from source history.
         if (reviewerStates.size > 128) reviewerStates.delete(reviewerStates.keys().next().value!)
       }
-      return outcome
+      return notices.length ? { ...outcome, notices } : outcome
     }
 
     async function generateText(
       prompt: string,
       selectedModel: ReviewerModel,
       signal: AbortSignal,
-    ): Promise<{ text?: string; timedOut: boolean }> {
+    ): Promise<{ text?: string; timedOut: boolean; error?: string }> {
       try {
         const result = await raceWithAbort(ctx.generate.text(
           { prompt, model: selectedModel },
           { signal },
         ), signal)
         return { text: result.text, timedOut: false }
-      } catch {
-        return { timedOut: signal.aborted }
+      } catch (error) {
+        return { timedOut: signal.aborted, error: describeError(error) }
       }
     }
 
-    async function getModel(): Promise<ReviewerModel | undefined> {
-      if (model) return model
-      pendingModel ??= (async () => {
-        const selected = await resolveModel(ctx, options.agent, options.model, options.timeoutMs, modelController.signal)
-        if (!selected || disposed || !options.modelOptions) return selected
+    async function getModel(): Promise<{ model: ReviewerModel | undefined; notices: string[] }> {
+      if (model) return { model, notices: modelNotices }
+      const pending = pendingModel ??= (async () => {
+        const notices: string[] = []
+        const selected = await resolveModel(ctx, options.agent, options.model, options.timeoutMs, modelController.signal, notices)
+        if (!selected || disposed || !options.modelOptions) return { model: selected, notices }
         const registered = await registerModelOptions(ctx.catalog, selected, options.modelOptions)
+        if ("error" in registered) {
+          notices.push(registered.error)
+          return { model: undefined, notices }
+        }
         if (disposed) {
           await registered.dispose()
-          return
+          return { model: undefined, notices }
         }
         modelRegistration = registered
-        return registered.model
+        return { model: registered.model, notices }
       })()
       try {
-        model = await pendingModel
-        return model
+        const resolved = await pending
+        model = resolved.model
+        modelNotices = resolved.notices
+        return resolved
       } finally {
         pendingModel = undefined
       }
@@ -236,14 +250,14 @@ export default Plugin.define({
       })
     }
 
-    function denyPolicy(event: PermissionEvent, reason: string): void {
+    function denyPolicy(event: PermissionEvent, reason: string, notices: readonly string[] = []): void {
       event.effect = "deny"
-      event.message = denialMessage(reason)
+      event.message = withNotices(denialMessage(reason), notices)
     }
 
-    function askHuman(event: PermissionEvent, reason: string): void {
+    function askHuman(event: PermissionEvent, reason: string, notices: readonly string[] = []): void {
       event.effect = "ask"
-      event.message = `Auto-review requires human confirmation: ${reason.trim()}`
+      event.message = withNotices(`Auto-review requires human confirmation: ${reason.trim()}`, notices)
     }
 
     return async () => {
@@ -264,6 +278,18 @@ export default Plugin.define({
 
 function denialMessage(reason: string): string {
   return `Auto-review denied: ${reason.trim()} Do not retry unchanged or bypass this decision with obfuscation, indirection, shell expansion, or hidden output.`
+}
+
+/** Surface reviewer degradation instead of hiding it behind an otherwise normal decision. */
+function withNotices(message: string, notices: readonly string[]): string {
+  const unique = [...new Set(notices.map((notice) => notice.trim()).filter(Boolean))]
+  return unique.length ? `${message} [auto-review fallback: ${unique.join("; ")}]` : message
+}
+
+function describeError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : typeof error === "string" ? error : ""
+  const clean = raw.replace(/\s+/g, " ").trim().slice(0, 300)
+  return clean || "unknown error"
 }
 
 function requestIdentity(event: PermissionEvent): string {
@@ -315,6 +341,7 @@ async function resolveModel(
   configured: string | undefined,
   timeoutMs: number,
   parentSignal: AbortSignal,
+  notices: string[],
 ): Promise<ReviewerModel | undefined> {
   if (parentSignal.aborted) return
   if (configured) return parseModel(configured)
@@ -325,13 +352,23 @@ async function resolveModel(
   try {
     try {
       const agent = await raceWithAbort(ctx.agent.get({ agentID }, { signal: controller.signal }), controller.signal)
-      if (agent.data.model) return copyModel(agent.data.model)
-    } catch {}
+      if (agent.data.model) {
+        notices.push(`no reviewer model configured; using the "${agentID}" agent model ${agent.data.model.providerID}/${agent.data.model.id}`)
+        return copyModel(agent.data.model)
+      }
+    } catch (error) {
+      notices.push(`reviewer agent lookup failed: ${describeError(error)}`)
+    }
     if (controller.signal.aborted) return
     try {
       const fallback = await raceWithAbort(ctx.catalog.model.default({}, { signal: controller.signal }), controller.signal)
-      if (fallback.data) return copyModel(fallback.data)
-    } catch {}
+      if (fallback.data) {
+        notices.push(`no reviewer model configured; using the catalog default model ${fallback.data.providerID}/${fallback.data.id}`)
+        return copyModel(fallback.data)
+      }
+    } catch (error) {
+      notices.push(`reviewer default model lookup failed: ${describeError(error)}`)
+    }
   } finally {
     clearTimeout(timer)
     parentSignal.removeEventListener("abort", onParentAbort)

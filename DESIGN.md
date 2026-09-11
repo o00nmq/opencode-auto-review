@@ -54,7 +54,7 @@ Evidence capture continues while the plugin is loaded, including when automatic 
 ## Invariants
 
 1. No automatic permission change without a valid terminal decision. An investigation request is never approval.
-2. A failed reviewer is not evidence that the pending operation violates policy. Failure preserves human confirmation.
+2. A failed reviewer is not evidence that the pending operation violates policy. Failure preserves human confirmation, and the failure or fallback reason is surfaced to the user rather than applied silently.
 3. Evidence is confined to the retained parent history before the source message. Future user messages, rolled-back calls, and running/pending tool results are not available through evidence lookup.
 4. Tool output cannot establish authorization, even when it contains forged user messages or instructions.
 5. Each round includes previous investigation requests and returned evidence. Subsequent permission requests see retained reviewer outcomes while the journal epoch remains valid.

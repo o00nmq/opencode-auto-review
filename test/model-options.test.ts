@@ -45,7 +45,8 @@ test("derived reviewer variant deep-merges overrides without changing original m
   const c = catalog()
   const options = { settings: { nested: { change: 2 }, list: [3] }, body: { max_tokens: 128, reasoning: { effort: "minimal" } } }
   const registered = await registerModelOptions(c.api, { providerID: "p", id: "m", variant: "low" }, options)
-  assert.match(registered.model.variant, /^opencode-auto-review-/)
+  if ("error" in registered) throw new Error(registered.error)
+  assert.match(registered.model.variant!, /^opencode-auto-review-/)
   assert.deepEqual(c.current().body, c.source.body)
   assert.deepEqual(c.current().variants[0], c.source.variants[0])
   const derived = c.current().variants[1]
