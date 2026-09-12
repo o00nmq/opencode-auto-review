@@ -1,6 +1,6 @@
 {
   "name": "opencode-auto-review",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "description": "Fail-safe automatic review for OpenCode V2 permission prompts",
   "keywords": [
     "opencode",
@@ -20,7 +20,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./tui": "./src/tui.tsx"
+    "./tui": "./src/tui.tsx",
+    "./rpc": "./src/rpc.ts"
   },
   "files": [
     "src",
@@ -37,13 +38,17 @@
     "prepack": "npm run check && npm test"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "beta"
+    "@opencode/plugin": "2.0.2"
   },
   "peerDependencies": {
+    "@opencode/theme": ">=2.0.2",
+    "@opentui/core": ">=0.5.10",
     "@opentui/solid": ">=0.5.10",
     "solid-js": ">=1.9.0"
   },
   "devDependencies": {
+    "@opencode/theme": "2.0.2",
+    "@opentui/core": "0.5.10",
     "@opentui/solid": "0.5.10",
     "@types/node": "^24.3.0",
     "solid-js": "^1.9.0",

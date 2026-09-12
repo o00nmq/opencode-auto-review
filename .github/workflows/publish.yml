@@ -29,5 +29,5 @@ jobs:
           cd "$work"
           npm init -y >/dev/null
           npm install "$RUNNER_TEMP/$archive" --ignore-scripts --silent
-          "$GITHUB_WORKSPACE/node_modules/.bin/tsx" -e "Promise.all([import('opencode-auto-review'), import('opencode-auto-review/tui')]).then(([server, tui]) => { if (server.default.id !== 'opencode-auto-review' || typeof server.default.setup !== 'function' || tui.default.id !== 'opencode-auto-review.tui') throw new Error('Invalid plugin exports') })"
+          "$GITHUB_WORKSPACE/node_modules/.bin/tsx" -e "Promise.all([import('opencode-auto-review'), import('opencode-auto-review/tui'), import('opencode-auto-review/rpc')]).then(([server, tui, rpc]) => { if (server.default.id !== 'opencode-auto-review' || typeof server.default.setup !== 'function' || tui.default.id !== 'opencode-auto-review.tui' || rpc.AutoReview.id !== 'opencode-auto-review') throw new Error('Invalid plugin exports') })"
       - run: npm publish --access public

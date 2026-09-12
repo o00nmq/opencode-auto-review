@@ -1,4 +1,4 @@
-import { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 import { createHash } from "node:crypto"
 import { KeyedQueue } from "./keyed-queue.js"
 import { captureEvidence } from "./evidence.js"
@@ -13,6 +13,7 @@ import {
 } from "./policy.js"
 import { buildReviewRequest } from "./review-input.js"
 import { prepareReviewJournal } from "./reviewer-journal.js"
+import { AutoReview } from "./rpc.js"
 import type { PermissionEvent, ReviewerJournalState, ReviewRequest } from "./types.js"
 
 const FAILURE_MESSAGE = "The request could not be verified for automatic approval."
@@ -39,20 +40,61 @@ export default Plugin.define({
       if (options.debug) console.info(`opencode-auto-review ${JSON.stringify(data)}`)
     }
 
+    // The authoritative toggle state is shared with the TUI over RPC. Emitting
+    // the state event keeps every client in sync regardless of which code path
+    // (slash command or RPC call) performed the change.
+    let emitState: (value: boolean) => void = () => undefined
+    const setEnabled = (next: boolean): boolean => {
+      if (disposed) return enabled
+      if (enabled === next) return enabled
+      enabled = next
+      if (!enabled) for (const controller of activeControllers.keys()) controller.abort()
+      emitState(enabled)
+      return enabled
+    }
+
+    const rpcRegistration = await ctx.rpc.register(AutoReview, {
+      status: async () => ({ enabled }),
+      setEnabled: async (input) => {
+        const requested = (input as { enabled?: unknown } | undefined)?.enabled
+        if (typeof requested === "boolean") setEnabled(requested)
+        return { enabled }
+      },
+    })
+    emitState = (value) => {
+      void rpcRegistration.events.emit("state", { enabled: value }).catch(() => undefined)
+    }
+
+    // Reviewer degradation is reported as a committed session timeline message,
+    // not a transient toast or a bottom pending-inbox item: it scrolls with the
+    // conversation and stays reviewable. `resume: true` (the default) commits the
+    // message; `resume: false` would queue it in the inbox instead.
+    const notifyReview = (sessionID: string, action: string, request: string, reason: string): void => {
+      if (disposed) return
+      const text = `Auto-review notice (${action}): ${reason.trim()}`
+      diagnose({ action, request, outcome: "notice", reason: text })
+      void ctx.session.synthetic({
+        sessionID,
+        text,
+        description: "Auto-review notice",
+        metadata: { request },
+        resume: true,
+      }).catch((error) => diagnose({ action, request, outcome: "notice_failed", reason: describeError(error) }))
+    }
+
     const commandRegistration = await ctx.command.transform((draft) => {
       draft.add({
         name: "auto-review",
         description: "Usage: /auto-review [on|off|toggle|status] (no argument toggles)",
         execute: async ({ sessionID, prompt, delivery }) => {
           const action = prompt.text.trim().toLowerCase() || "toggle"
-          if (action === "on" || action === "enable") enabled = true
-          else if (action === "off" || action === "disable") enabled = false
-          else if (action === "toggle") enabled = !enabled
+          if (action === "on" || action === "enable") setEnabled(true)
+          else if (action === "off" || action === "disable") setEnabled(false)
+          else if (action === "toggle") setEnabled(!enabled)
           else if (action !== "status") {
             await showStatus(sessionID, delivery, "Usage: /auto-review [on|off|toggle|status]")
             return
           }
-          if (!enabled) for (const controller of activeControllers.keys()) controller.abort()
           await showStatus(sessionID, delivery, `Auto-review is ${enabled ? "enabled" : "disabled"}.`)
         },
       })
@@ -67,6 +109,12 @@ export default Plugin.define({
 
     // Capture committed originals before model dispatch, including compaction requests.
     const contextRegistration = await ctx.session.hook("context", async (event) => {
+      if (!disposed) await archive.load(event.sessionID, modelController.signal)
+    })
+
+    // V2 dispatches checkpoint summaries through the separate compaction hook, so
+    // capture the same originals there to keep authorization completeness intact.
+    const compactionRegistration = await ctx.session.hook("compaction", async (event) => {
       if (!disposed) await archive.load(event.sessionID, modelController.signal)
     })
 
@@ -89,21 +137,21 @@ export default Plugin.define({
       const deadline = Date.now() + options.timeoutMs
       const timer = setTimeout(() => controller.abort(), options.timeoutMs)
       activeControllers.set(controller, event.sessionID)
+      const key = requestIdentity(event as PermissionEvent)
       try {
-        const key = requestIdentity(event as PermissionEvent)
         diagnose({ action: event.action, request: key, outcome: "started" })
         const outcome = await raceWithAbort(reviewRequest(key, event as PermissionEvent, controller.signal, deadline), controller.signal)
         if (disposed || !enabled || controller.signal.aborted) return
         if (Date.now() >= deadline) {
+          notifyReview(event.sessionID, event.action, key, "Automatic review reached its deadline")
           askHuman(event as PermissionEvent, "Automatic review reached its deadline")
           return
         }
         diagnose({ action: event.action, request: key, outcome: outcome.code })
         const notices = outcome.notices ?? []
-        // Keep diagnostics out of the session inbox: queued synthetic notices remain
-        // pending while permission is blocked and can pollute the next model turn.
+        // Reviewer degradation is surfaced once, in the conversation timeline.
         const degraded = degradationReasons(outcome, notices)
-        if (degraded.length) diagnose({ action: event.action, outcome: outcome.code, reason: degraded.join("; ") })
+        if (degraded.length) notifyReview(event.sessionID, event.action, key, degraded.join("; "))
         if (outcome.decision?.decision === "allow") {
           event.effect = "allow"
           event.message = withNotices(outcome.decision.reason ? `Auto-review approved: ${outcome.decision.reason}` : `Auto-review approved: ${event.action}.`, notices)
@@ -113,8 +161,13 @@ export default Plugin.define({
         else askHuman(event as PermissionEvent, outcome.decision?.reason ?? outcome.message ?? REVIEWER_FAILURE_MESSAGE, notices)
       } catch {
         if (!disposed) {
-          diagnose({ action: event.action, outcome: controller.signal.aborted ? "aborted" : "failure" })
-          askHuman(event as PermissionEvent, controller.signal.aborted ? "Automatic review was cancelled or reached its deadline" : REVIEWER_FAILURE_MESSAGE)
+          const aborted = controller.signal.aborted
+          diagnose({ action: event.action, outcome: aborted ? "aborted" : "failure" })
+          const timedOut = aborted && Date.now() >= deadline
+          const message = timedOut ? "Automatic review reached its deadline"
+            : aborted ? "Automatic review was cancelled" : REVIEWER_FAILURE_MESSAGE
+          if (!aborted || timedOut) notifyReview(event.sessionID, event.action, key, message)
+          askHuman(event as PermissionEvent, message)
         }
       } finally {
         activeControllers.delete(controller)
@@ -245,12 +298,14 @@ export default Plugin.define({
     }
 
     async function showStatus(sessionID: string, delivery: "steer" | "queue", text: string): Promise<void> {
+      // `resume: false` would park this in the bottom pending inbox. Commit it to
+      // the timeline instead so control feedback also scrolls with the session.
       await ctx.session.synthetic({
         sessionID,
         text,
         description: text,
         delivery,
-        resume: false,
+        resume: true,
       })
     }
 
@@ -275,6 +330,8 @@ export default Plugin.define({
       await commandRegistration.dispose()
       await promptRegistration.dispose()
       await contextRegistration.dispose()
+      await compactionRegistration.dispose()
+      await rpcRegistration.dispose()
       await modelRegistration?.dispose()
     }
   },

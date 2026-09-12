@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import type { Model, Plugin } from "@opencode-ai/plugin"
+import type { Model, Plugin } from "@opencode/plugin"
 
 export interface ModelOptions {
   settings?: Record<string, unknown>

@@ -34,13 +34,18 @@ function createHarness(
   let evaluate: ((event: any) => Promise<void>) | undefined
   let command: ((input: any) => Promise<void>) | undefined
   let onPrompt: ((event: any) => void) | undefined
+  let onCompaction: ((event: any) => Promise<void> | void) | undefined
   let generateCalls = 0
   let contextCalls = 0
   let disposed = 0
+  let rpcDisposed = 0
+  let rpcHandlers: Record<string, (input: any, context: any) => Promise<unknown>> | undefined
+  const rpcEvents: { name: string; data: any }[] = []
   let generationSignal: AbortSignal | undefined
   const generatedPrompts: string[] = []
   const synthetic: string[] = []
   const syntheticDescriptions: string[] = []
+  const syntheticCalls: Array<{ sessionID?: string; text: string; description?: string; delivery?: string; resume?: boolean | null; metadata?: Record<string, unknown> }> = []
   let commandDescription = ""
   const messages: any[] = [
     { id: "user", type: "user", text: "Read package.json" },
@@ -91,12 +96,14 @@ function createHarness(
     session: {
       hook: async (_name: string, callback: typeof onPrompt) => {
         if (_name === "prompt") onPrompt = callback
+        if (_name === "compaction") onCompaction = callback
         return { dispose: async () => undefined }
       },
       context: async () => { contextCalls++; return context ? context() : messages },
-      synthetic: async ({ text, description }: { text: string; description: string }) => {
-        synthetic.push(text)
-        syntheticDescriptions.push(description)
+      synthetic: async (input: { sessionID?: string; text: string; description?: string; delivery?: string; resume?: boolean | null; metadata?: Record<string, unknown> }) => {
+        syntheticCalls.push(structuredClone(input))
+        synthetic.push(input.text)
+        if (input.description) syntheticDescriptions.push(input.description)
       },
     },
     generate: { text: async (input: any, requestOptions: { signal?: AbortSignal }) => {
@@ -108,6 +115,15 @@ function createHarness(
     } },
     agent: { get: async () => { throw new Error("missing") } },
     catalog: catalogOverride ?? defaultCatalog,
+    rpc: {
+      register: async (_definition: unknown, handlers: Record<string, (input: any, context: any) => Promise<unknown>>) => {
+        rpcHandlers = handlers
+        return {
+          events: { emit: async (name: string, data: unknown) => { rpcEvents.push({ name, data }) } },
+          dispose: async () => { rpcDisposed++ },
+        }
+      },
+    },
   }
   return {
     async setup() {
@@ -136,11 +152,27 @@ function createHarness(
     counts: () => ({ generateCalls, contextCalls, disposed }),
     commandDescription: () => commandDescription,
     visibleStatus: () => syntheticDescriptions.at(-1),
-    visibleMessages: () => synthetic.slice(),
+    // Bottom pending-inbox items only; a committed timeline notice is not one.
+    visibleMessages: () => syntheticCalls.filter((call) => call.resume === false).map((call) => call.text),
+    timelineNotices: () => syntheticCalls.filter((call) => call.resume !== false),
     messages,
     generationSignal: () => generationSignal,
     generatedPrompts: () => generatedPrompts,
     admitPrompt: (sessionID: string) => onPrompt!({ sessionID }),
+    async compact(sessionID = "ses_test") {
+      assert.ok(onCompaction)
+      await onCompaction({ sessionID, model: {}, system: [], messages: [], options: {} })
+    },
+    async rpcStatus() {
+      assert.ok(rpcHandlers?.status)
+      return rpcHandlers.status(undefined, {})
+    },
+    async rpcSetEnabled(value: boolean) {
+      assert.ok(rpcHandlers?.setEnabled)
+      return rpcHandlers.setEnabled({ enabled: value }, {})
+    },
+    rpcEvents: () => rpcEvents.slice(),
+    rpcDisposed: () => rpcDisposed,
     catalogModel,
   }
 }
@@ -155,6 +187,7 @@ test("only a valid eligible ask can be auto-allowed", async () => {
   assert.deepEqual(harness.counts(), { generateCalls: 1, contextCalls: 1, disposed: 0 })
   await cleanup?.()
   assert.equal(harness.counts().disposed, 1)
+  assert.equal(harness.rpcDisposed(), 1)
 })
 
 test("retains prior review outcomes per main session", async () => {
@@ -469,4 +502,70 @@ test("default Chat budget preserves the selected native reasoning variant", asyn
   const cleanup = await harness.setup()
   assert.equal((await harness.run()).effect, "allow")
   await cleanup?.()
+})
+
+test("the RPC contract and the slash command share one toggle state and emit state events", async () => {
+  const harness = createHarness()
+  await harness.setup()
+  assert.deepEqual(await harness.rpcStatus(), { enabled: true })
+  await harness.rpcSetEnabled(false)
+  assert.deepEqual(await harness.rpcStatus(), { enabled: false })
+  assert.equal((await harness.run()).effect, "ask")
+  assert.equal(await harness.command("on"), "Auto-review is enabled.")
+  assert.deepEqual(await harness.rpcStatus(), { enabled: true })
+  assert.equal((await harness.run()).effect, "allow")
+  assert.deepEqual(harness.rpcEvents().map((event) => event.name), ["state", "state"])
+  assert.deepEqual(harness.rpcEvents().map((event) => (event.data as { enabled: boolean }).enabled), [false, true])
+})
+
+test("the compaction hook captures original history like the context hook", async () => {
+  const harness = createHarness()
+  await harness.setup()
+  assert.equal(harness.counts().contextCalls, 0)
+  await harness.compact()
+  assert.equal(harness.counts().contextCalls, 1)
+})
+
+test("reviewer degradation is reported as a committed timeline notice, not an inbox item", async () => {
+  const harness = createHarness({}, async () => { throw new Error("provider secret") })
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "ask")
+  assert.deepEqual(harness.visibleMessages(), [], "failures must not leave pending synthetic inbox messages")
+  const notices = harness.timelineNotices()
+  assert.equal(notices.length, 1)
+  const notice = notices[0]!
+  assert.equal(notice.sessionID, "ses_test", "the notice must be attributed to the reviewed session")
+  assert.match(notice.text, /reviewer model call failed/)
+  assert.equal(notice.resume, true)
+  assert.equal(notice.description, "Auto-review notice")
+  assert.ok(notice.metadata?.request, "the notice must carry the request identity")
+})
+
+test("a model fallback is surfaced once in the timeline even for an approval", async () => {
+  const harness = createHarness({ model: null })
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "allow")
+  assert.match((event as any).message, /auto-review fallback/)
+  const notices = harness.timelineNotices()
+  assert.equal(notices.length, 1)
+  assert.match(notices[0]!.text, /catalog default model test\/reviewer/)
+  assert.deepEqual(harness.visibleMessages(), [])
+})
+
+test("a clean reviewer decision emits no timeline notice", async () => {
+  const harness = createHarness()
+  await harness.setup()
+  assert.equal((await harness.run()).effect, "allow")
+  assert.deepEqual(harness.timelineNotices(), [])
+})
+
+test("the explicit status command commits its output to the timeline instead of the inbox", async () => {
+  const harness = createHarness()
+  await harness.setup()
+  assert.equal(await harness.command("status"), "Auto-review is enabled.")
+  assert.deepEqual(harness.visibleMessages(), [])
+  assert.equal(harness.timelineNotices().length, 1)
+  assert.equal(harness.timelineNotices()[0]!.resume, true)
 })

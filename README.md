@@ -26,13 +26,13 @@ Choose a reviewer model in `opencode.json(c)`. Replace the example with an avail
 }
 ```
 
-The model is optional: the plugin falls back to the `auto-reviewer` agent's model, then OpenCode's default. Reviewer fallbacks, model-registration failures, and exhausted provider errors are reported in the permission message and debug diagnostics. They do not enqueue synthetic session messages that linger beneath the conversation.
+The model is optional: the plugin falls back to the `auto-reviewer` agent's model, then OpenCode's default. Reviewer fallbacks, model-registration failures, exhausted provider errors, and timeouts are shown as messages in the conversation timeline: they scroll with the session and can be reviewed later. They are never queued in the bottom pending inbox, and they do not change the permission decision.
 
 Automatic review is enabled by default, with **2,048 output tokens** and **90 seconds total per request**. Change these with `maxReviewTokens` and `timeoutMs`. The default output parameter targets Chat Completions; see [advanced configuration](DESIGN.md#configuration) for other APIs and human-only rules.
 
 ## Usage
 
-Use `/auto-review on`, `/auto-review off`, `/auto-review toggle`, or `/auto-review status`. The command palette also provides **Toggle Auto-review**.
+Use `/auto-review on`, `/auto-review off`, `/auto-review toggle`, or `/auto-review status`. The command palette also provides **Toggle Auto-review**. The TUI reads and changes this state over the plugin RPC contract instead of parsing session text; the slash command keeps its explicit status output.
 
 The plugin handles eligible requests that would otherwise ask for permission. It can consult earlier user instructions and tool results when needed, including after the main conversation is compacted. Its feedback is limited to permission and safety decisions.
 
