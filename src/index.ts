@@ -100,9 +100,10 @@ export default Plugin.define({
         }
         diagnose({ action: event.action, request: key, outcome: outcome.code })
         const notices = outcome.notices ?? []
-        // Surface reviewer degradation as a session notice, not only inside the permission prompt.
+        // Keep diagnostics out of the session inbox: queued synthetic notices remain
+        // pending while permission is blocked and can pollute the next model turn.
         const degraded = degradationReasons(outcome, notices)
-        if (degraded.length) await notify(event.sessionID, `Auto-review fallback on ${event.action}: ${degraded.join("; ")}`)
+        if (degraded.length) diagnose({ action: event.action, outcome: outcome.code, reason: degraded.join("; ") })
         if (outcome.decision?.decision === "allow") {
           event.effect = "allow"
           event.message = withNotices(outcome.decision.reason ? `Auto-review approved: ${outcome.decision.reason}` : `Auto-review approved: ${event.action}.`, notices)
@@ -251,13 +252,6 @@ export default Plugin.define({
         delivery,
         resume: false,
       })
-    }
-
-    /** Best-effort session notice; never let a notice failure change a permission decision. */
-    async function notify(sessionID: string, text: string): Promise<void> {
-      try {
-        await ctx.session.synthetic({ sessionID, text, description: text, delivery: "queue", resume: false })
-      } catch {}
     }
 
     function denyPolicy(event: PermissionEvent, reason: string, notices: readonly string[] = []): void {

@@ -64,6 +64,48 @@ test("malformed output is repaired using feedback in the next round", async () =
   assert.match(prompts[1]!, /invalid_response/)
 })
 
+test("empty and whitespace output recover without involving the user", async () => {
+  for (const empty of ["", "  \n"]) {
+    const { result, calls, prompts } = await run([empty, JSON.stringify({
+      decision: "allow", risk: "low", authorization: "high", matched_rules: [],
+    })])
+    assert.equal(result.decision?.decision, "allow")
+    assert.equal(calls, 2)
+    assert.match(prompts[1]!, /empty_response/)
+  }
+})
+
+test("persistent empty output stops after one recovery attempt", async () => {
+  const { result, calls } = await run([""])
+  assert.equal(result.code, "empty_response")
+  assert.equal(result.decision, undefined)
+  assert.equal(calls, 2)
+})
+
+test("provider failure can recover within the original deadline", async () => {
+  let calls = 0
+  const result = await runReviewLoop({
+    lines: [JSON.stringify({ type: "user", text: "Test the project" })],
+    evidence: captureEvidence(messages, event), options, maxInputTokens: 16_000,
+    signal: new AbortController().signal, deadline: Date.now() + options.timeoutMs,
+    generate: async () => ++calls === 1 ? { timedOut: false, error: "temporary provider failure" }
+      : { timedOut: false, text: JSON.stringify({ decision: "allow", risk: "low", authorization: "high", matched_rules: [] }) },
+  })
+  assert.equal(result.decision?.decision, "allow")
+  assert.equal(calls, 2)
+})
+
+test("a timed out generation is not retried", async () => {
+  let calls = 0
+  const result = await runReviewLoop({
+    lines: [], evidence: captureEvidence(messages, event), options, maxInputTokens: 16_000,
+    signal: new AbortController().signal, deadline: Date.now() + options.timeoutMs,
+    generate: async () => { calls++; return { timedOut: true } },
+  })
+  assert.equal(result.code, "timeout")
+  assert.equal(calls, 1)
+})
+
 test("evidence is a snapshot and cannot access pending tools or future users", () => {
   const source = structuredClone(messages)
   const evidence = captureEvidence(source, event)

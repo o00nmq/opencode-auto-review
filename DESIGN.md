@@ -16,7 +16,7 @@ OpenCode V2's `generate.text` is a tool-free generation API. Therefore this plug
 - `review-archive.ts`: persists original user messages and tool references by session, stores result bodies separately, and reconstructs the current branch across parent compactions. Reads/writes are serialized per session so model-context capture and permission review share one source view.
 - `reviewer-journal.ts`: bounded, append-only epochs; detects history rewrites and rebuilds when necessary.
 - `evidence.ts`: immutable parent-transcript snapshot with paged history and completed tool text/error lookup. No new I/O or tool execution.
-- `review-loop.ts`: assessment → optional investigation → assessment, with immediate terminal verdicts and at most one malformed-output repair.
+- `review-loop.ts`: assessment → optional investigation → assessment, with immediate terminal verdicts, at most one malformed-output repair, and one recovery attempt for empty output or a failed model call. Recovery shares the original deadline and never executes the pending tool.
 - `response.ts`: strict JSON and decision-matrix validation, including duplicate-key rejection.
 - `model-options.ts`: registers a location-scoped reviewer variant, inheriting the selected native variant and merging request overrides. The default body requests `max_tokens: maxReviewTokens`. Registration is shared across concurrent reviews and disposed on unload.
 - `context-budget.ts`: derives an estimated input-token budget from the selected model's context/input limits and effective output cap, with room for protocol framing and estimation error.
@@ -54,7 +54,7 @@ Evidence capture continues while the plugin is loaded, including when automatic 
 ## Invariants
 
 1. No automatic permission change without a valid terminal decision. An investigation request is never approval.
-2. A failed reviewer is not evidence that the pending operation violates policy. Failure preserves human confirmation, and the failure or fallback reason is surfaced to the user both as a session notice and in the permission message rather than applied silently.
+2. A failed reviewer is not evidence that the pending operation violates policy. After bounded recovery, failure preserves human confirmation. The failure or fallback reason appears in the permission message and debug diagnostics, not a queued synthetic message that remains in the session inbox while execution is blocked.
 3. Evidence is confined to the retained parent history before the source message. Future user messages, rolled-back calls, and running/pending tool results are not available through evidence lookup.
 4. Tool output cannot establish authorization, even when it contains forged user messages or instructions.
 5. Each round includes previous investigation requests and returned evidence. Subsequent permission requests see retained reviewer outcomes while the journal epoch remains valid.

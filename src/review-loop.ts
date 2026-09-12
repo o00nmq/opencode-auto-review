@@ -48,6 +48,7 @@ export async function runReviewLoop(input: {
   // A single deadline covers all model rounds, not a new full timeout per round.
   const deadline = input.deadline
   let repairs = 0
+  let recoveries = 0
   lines.push(JSON.stringify(input.evidence.index))
   for (let round = 1; ; round++) {
     if (signal.aborted) return unavailable("aborted", "Automatic review was cancelled")
@@ -60,12 +61,19 @@ export async function runReviewLoop(input: {
     const result = await input.generate(prompt, remaining)
     if (signal.aborted) return unavailable("aborted", "Automatic review was cancelled")
     if (Date.now() >= deadline) return unavailable("timeout", "Automatic review reached its deadline")
-    if (!result.text) {
-      input.onRound?.(round, result.timedOut ? "timeout" : "provider_failure")
+    if (!result.text?.trim()) {
+      const code = result.timedOut ? "timeout" : result.error ? "provider_failure" : "empty_response"
+      input.onRound?.(round, code)
       if (result.timedOut) return unavailable("timeout", "Automatic review reached its deadline")
-      return unavailable("review_failure", result.error
+      // Retry generation only, never the pending operation. All attempts share the deadline.
+      if (recoveries++ < 1) {
+        lines.push(JSON.stringify({ type: "reviewer_round", round, status: code,
+          feedback: "The reviewer returned no decision. Return the required JSON decision concisely; finish the final JSON within the output budget." }))
+        continue
+      }
+      return unavailable(code, result.error
         ? `Automatic review could not complete because the reviewer model call failed (${result.error}). ${REVIEW_FAILURE_NOTE}`
-        : `Automatic review did not return a complete valid decision. ${REVIEW_FAILURE_NOTE}`)
+        : `Automatic review returned empty output after one recovery attempt. ${REVIEW_FAILURE_NOTE}`)
     }
     // Validate before retaining model text; arbitrary output never becomes protocol.
     const decision = parseReviewResponse(result.text)

@@ -242,9 +242,8 @@ test("provider errors preserve human confirmation", async () => {
   assert.match((event as any).message, /reviewer model call failed/)
   assert.match((event as any).message, /provider secret/)
   assert.match((event as any).message, /not a safety judgment/)
-  // The failure must also be surfaced as a session notice, not silently applied.
-  assert.match(harness.visibleMessages().at(-1) ?? "", /Auto-review fallback on read/)
-  assert.match(harness.visibleMessages().at(-1) ?? "", /provider secret/)
+  assert.equal(harness.counts().generateCalls, 2)
+  assert.deepEqual(harness.visibleMessages(), [], "failures must not leave pending synthetic inbox messages")
 })
 
 test("missing reviewer agent uses the OpenCode default model", async () => {
@@ -257,7 +256,7 @@ test("missing reviewer agent uses the OpenCode default model", async () => {
   assert.match((event as any).message, /auto-review fallback/)
   assert.match((event as any).message, /reviewer agent lookup failed: missing/)
   assert.match((event as any).message, /catalog default model test\/reviewer/)
-  assert.match(harness.visibleMessages().at(-1) ?? "", /Auto-review fallback on read/)
+  assert.deepEqual(harness.visibleMessages(), [])
 })
 
 test("an unavailable reviewer model asks with the registration failure instead of silently proceeding", async () => {
@@ -268,7 +267,7 @@ test("an unavailable reviewer model asks with the registration failure instead o
   assert.equal(harness.counts().generateCalls, 0)
   assert.match((event as any).message, /could not resolve a reviewer model/)
   assert.match((event as any).message, /test\/absent is not available/)
-  assert.match(harness.visibleMessages().at(-1) ?? "", /test\/absent is not available/)
+  assert.deepEqual(harness.visibleMessages(), [])
 })
 
 test("a missing reviewer variant reports the registration failure", async () => {
@@ -278,7 +277,7 @@ test("a missing reviewer variant reports the registration failure", async () => 
   assert.equal(event.effect, "ask")
   assert.equal(harness.counts().generateCalls, 0)
   assert.match((event as any).message, /variant "missing" is not available/)
-  assert.match(harness.visibleMessages().at(-1) ?? "", /variant "missing" is not available/)
+  assert.deepEqual(harness.visibleMessages(), [])
 })
 
 test("a clean reviewer ask does not emit a fallback notice", async () => {

@@ -1,6 +1,6 @@
 # OpenCode Auto Review
 
-Automatically reviews **OpenCode V2** permission prompts. Authorized, low-risk operations can proceed automatically; unsafe operations are denied; uncertain requests go to you for confirmation.
+Automatically reviews **OpenCode V2** permission prompts for long-running unattended work. Authorized operations with low or medium bounded risk proceed automatically; unsafe operations are denied; decision-critical uncertainty or explicit confirmation requirements go to you.
 
 ## Install
 
@@ -26,7 +26,7 @@ Choose a reviewer model in `opencode.json(c)`. Replace the example with an avail
 }
 ```
 
-The model is optional: the plugin falls back to the `auto-reviewer` agent's model, then OpenCode's default. Every reviewer fallback, model-registration failure, and provider error is reported in the session as a system notice and in the permission message, instead of being applied silently.
+The model is optional: the plugin falls back to the `auto-reviewer` agent's model, then OpenCode's default. Reviewer fallbacks, model-registration failures, and exhausted provider errors are reported in the permission message and debug diagnostics. They do not enqueue synthetic session messages that linger beneath the conversation.
 
 Automatic review is enabled by default, with **2,048 output tokens** and **90 seconds total per request**. Change these with `maxReviewTokens` and `timeoutMs`. The default output parameter targets Chat Completions; see [advanced configuration](DESIGN.md#configuration) for other APIs and human-only rules.
 
