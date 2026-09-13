@@ -2,6 +2,15 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import tui from "../src/tui.js"
 
+// tsx transpiles TSX with the classic runtime, while the plugin's JSX targets
+// Solid (@opentui/solid) and is normally executed by the host. Tests only need
+// the component body to run so it registers its keymap layer, so provide a
+// minimal element factory rather than mounting a renderer.
+;(globalThis as { React?: unknown }).React = {
+  createElement: (type: unknown, props: unknown, ...children: unknown[]) => ({ type, props, children }),
+  Fragment: Symbol("Fragment"),
+}
+
 /** A stateful fake RPC server so the TUI state is real, not just handler capture. */
 function harness(options: { enabled?: boolean; failSwitch?: boolean } = {}) {
   let enabled = options.enabled ?? true
@@ -11,6 +20,7 @@ function harness(options: { enabled?: boolean; failSwitch?: boolean } = {}) {
   const connectedHandlers: Array<() => void> = []
   let selectReply: string | undefined
   const commands: any[] = []
+  let slotClaim: any
   const client: any = {
     status: async (input: unknown, callOptions: any) => {
       statusCalls.push({ input, options: callOptions })
@@ -31,7 +41,7 @@ function harness(options: { enabled?: boolean; failSwitch?: boolean } = {}) {
     data: { on: (_name: string, handler: () => void) => { connectedHandlers.push(handler); return () => undefined } },
     ui: {
       toast: { show: (toast: any) => toasts.push(toast) },
-      slot: () => () => undefined,
+      slot: (claim: any) => { slotClaim = claim; return () => undefined },
       router: { current: () => ({ type: "session", sessionID: "ses" }) },
       dialog: { select: async () => selectReply },
     },
@@ -44,6 +54,14 @@ function harness(options: { enabled?: boolean; failSwitch?: boolean } = {}) {
     setFailStatus: (value: boolean) => { failStatus = value },
     serverState: () => enabled,
     connect: () => connectedHandlers.forEach((handler) => handler()),
+    // The host renders a slot claim inside a component, which is where the
+    // keymap layer must be registered. Invoking render exercises that path.
+    renderSlot: () => {
+      const element = slotClaim.render({ mode: "normal" })
+      // The stub factory only records the element; invoke the component the
+      // way a renderer would so its body (and keymap registration) runs.
+      if (element && typeof element.type === "function") element.type(element.props)
+    },
   }
 }
 
@@ -52,6 +70,7 @@ const tick = () => new Promise((resolve) => setImmediate(resolve))
 test("the footer command shows the RPC-confirmed state and reflects a real switch", async () => {
   const h = harness({ enabled: true })
   const cleanup = await tui.setup(h.context)
+  h.renderSlot()
   const run = h.commands.find((command) => command.id === "auto-review.toggle")!.run
   await tick()
   assert.deepEqual(h.statusCalls[0]!.options, { location: { directory: "/repo", workspace: "ws" } })
@@ -75,6 +94,7 @@ test("the footer command shows the RPC-confirmed state and reflects a real switc
 test("a switch that cannot be confirmed toasts and keeps the previous state", async () => {
   const h = harness({ enabled: true, failSwitch: true })
   const cleanup = await tui.setup(h.context)
+  h.renderSlot()
   const run = h.commands.find((command) => command.id === "auto-review.toggle")!.run
   await tick()
 
@@ -93,6 +113,7 @@ test("a switch that cannot be confirmed toasts and keeps the previous state", as
 test("a status query that cannot be confirmed is never reported as the current state", async () => {
   const h = harness({ enabled: true })
   const cleanup = await tui.setup(h.context)
+  h.renderSlot()
   const run = h.commands.find((command) => command.id === "auto-review.toggle")!.run
   await tick()
   h.setFailStatus(true)
@@ -109,5 +130,15 @@ test("reconnect re-queries the authoritative state", async () => {
   h.connect()
   await tick()
   assert.ok(h.statusCalls.length >= 2)
+  await cleanup?.()
+})
+
+test("setup never registers a keymap layer outside the component tree", async () => {
+  // The host only provides the keymap context to rendered components. setup
+  // runs outside it, so touching keymap there would fail plugin load with
+  // "Keymap.Provider is missing".
+  const h = harness()
+  h.context.keymap.layer = () => { throw new Error("Keymap.Provider is missing") }
+  const cleanup = await tui.setup(h.context)
   await cleanup?.()
 })

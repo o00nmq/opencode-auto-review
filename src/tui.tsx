@@ -27,55 +27,60 @@ export default Plugin.define({
     // A reconnect may have missed state events; re-query the authoritative state.
     const stopConnected = ctx.data.on("server.connected", () => void controller.refresh())
 
-    ctx.keymap.layer(() => ({
-      mode: "global",
-      priority: 10,
-      commands: [{
-        id: "auto-review.toggle",
-        title: "Toggle Auto-review",
-        group: "Auto-review",
-        palette: true,
-        suggested: true,
-        enabled: () => ctx.ui.router.current().type === "session",
-        run: async () => {
-          const route = ctx.ui.router.current()
-          if (route.type !== "session") {
-            ctx.ui.toast.show({ message: "Open a session to change auto-review mode", variant: "warning" })
-            return
-          }
-          if (disposed) return
-          const action = await ctx.ui.dialog.select({
-            title: "Auto-review mode",
-            options: [
-              { title: "Enable", value: "on", description: "Review eligible requests; ask when evidence or confirmation is needed" },
-              { title: "Disable", value: "off", description: "Use normal OpenCode permission handling" },
-              { title: "Show status", value: "status" },
-            ],
-          })
-          if (!action || disposed) return
-          if (action === "status") {
-            const confirmed = await controller.refresh()
-            if (disposed) return
-            if (!confirmed) {
-              toast("Auto-review status is unavailable right now.")
+    // A keymap layer is owned by the calling Solid component. `setup` runs
+    // outside the keymap provider tree, so registering here would throw
+    // "Keymap.Provider is missing"; register from a rendered component instead.
+    const Status = (props: { mode: string }) => {
+      ctx.keymap.layer(() => ({
+        mode: "global",
+        priority: 10,
+        commands: [{
+          id: "auto-review.toggle",
+          title: "Toggle Auto-review",
+          group: "Auto-review",
+          palette: true,
+          suggested: true,
+          enabled: () => ctx.ui.router.current().type === "session",
+          run: async () => {
+            const route = ctx.ui.router.current()
+            if (route.type !== "session") {
+              ctx.ui.toast.show({ message: "Open a session to change auto-review mode", variant: "warning" })
               return
             }
-            ctx.ui.toast.show({ message: `Auto-review is ${controller.enabled() ? "enabled" : "disabled"}.` })
-            return
-          }
-          await controller.setEnabled(action === "on")
-        },
-      }],
-      bindings: ["auto-review.toggle"],
-    }))
+            if (disposed) return
+            const action = await ctx.ui.dialog.select({
+              title: "Auto-review mode",
+              options: [
+                { title: "Enable", value: "on", description: "Review eligible requests; ask when evidence or confirmation is needed" },
+                { title: "Disable", value: "off", description: "Use normal OpenCode permission handling" },
+                { title: "Show status", value: "status" },
+              ],
+            })
+            if (!action || disposed) return
+            if (action === "status") {
+              const confirmed = await controller.refresh()
+              if (disposed) return
+              if (!confirmed) {
+                toast("Auto-review status is unavailable right now.")
+                return
+              }
+              ctx.ui.toast.show({ message: `Auto-review is ${controller.enabled() ? "enabled" : "disabled"}.` })
+              return
+            }
+            await controller.setEnabled(action === "on")
+          },
+        }],
+        bindings: ["auto-review.toggle"],
+      }))
 
-    const Status = (props: { mode: string }) => (
-      <Show when={enabled() && props.mode === "normal"}>
-        <text fg={ctx.theme.text.action.primary.default}>
-          <b>Auto Mode</b>
-        </text>
-      </Show>
-    )
+      return (
+        <Show when={enabled() && props.mode === "normal"}>
+          <text fg={ctx.theme.text.action.primary.default}>
+            <b>Auto Mode</b>
+          </text>
+        </Show>
+      )
+    }
 
     const removeStatus = ctx.ui.slot({
       append: "prompt.footer.status",
