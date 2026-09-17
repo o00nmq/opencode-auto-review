@@ -55,6 +55,14 @@ function createHarness(
   ]
   const pluginOptions: Record<string, unknown> = { model: "test/reviewer", ...options }
   if (options.model === null) delete pluginOptions.model
+  // Session records for notice routing. Tests seed `ses_test` -> "ses_parent" to
+  // model a subagent; an unseeded session is treated as a root session.
+  const sessions: Record<string, { parentID?: string; agent?: string; title?: string; error?: boolean }> = {}
+  const sessionInfo = (sessionID: string) => {
+    const record = sessions[sessionID]
+    if (record?.error) throw new Error(`session lookup failed: ${sessionID}`)
+    return { id: sessionID, ...record }
+  }
   const catalogModel: any = { providerID: "test", id: "reviewer", limit: { context: 128_000, input: 120_000, output: 8192 }, variants: [
     { id: "max", settings: { reasoningEffort: "high" }, body: { reasoning: { effort: "high" } } },
   ] }
@@ -100,6 +108,7 @@ function createHarness(
         return { dispose: async () => undefined }
       },
       context: async () => { contextCalls++; return context ? context() : messages },
+      get: async ({ sessionID }: { sessionID: string }) => sessionInfo(sessionID),
       synthetic: async (input: { sessionID?: string; text: string; description?: string; delivery?: string; resume?: boolean | null; metadata?: Record<string, unknown> }) => {
         syntheticCalls.push(structuredClone(input))
         synthetic.push(input.text)
@@ -142,6 +151,9 @@ function createHarness(
         ...patch,
       }
       await evaluate!(event)
+      // Notices are fire-and-forget and may await session lookups before they
+      // commit, so settle that chain before callers inspect synthetic output.
+      for (let turn = 0; turn < 4; turn++) await new Promise((done) => setImmediate(done))
       return event
     },
     async command(text: string) {
@@ -174,6 +186,7 @@ function createHarness(
     rpcEvents: () => rpcEvents.slice(),
     rpcDisposed: () => rpcDisposed,
     catalogModel,
+    sessions,
   }
 }
 
@@ -536,10 +549,77 @@ test("reviewer degradation is reported as a committed timeline notice, not an in
   assert.equal(notices.length, 1)
   const notice = notices[0]!
   assert.equal(notice.sessionID, "ses_test", "the notice must be attributed to the reviewed session")
-  assert.match(notice.text, /reviewer model call failed/)
   assert.equal(notice.resume, true)
-  assert.equal(notice.description, "Auto-review notice")
+  // The timeline paints `description`, so the reason must live there.
+  assert.match(notice.description!, /reviewer model call failed/)
+  assert.match(notice.description!, /provider secret/)
+  // `text` enters the model's context on every turn, so it stays a short sentence
+  // and does not replay reviewer internals.
+  assert.doesNotMatch(notice.text, /provider secret/)
+  assert.match(notice.text, /needs your confirmation/)
   assert.ok(notice.metadata?.request, "the notice must carry the request identity")
+})
+
+test("a fallback notice's text agrees with the applied verdict, not assumed escalation", async () => {
+  // A model fallback can accompany a completed approval, so the replayed `text`
+  // must not claim confirmation is still needed.
+  const harness = createHarness({ model: null })
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "allow")
+  const notice = harness.timelineNotices()[0]!
+  assert.match(notice.text, /Auto-review approved the pending read request/)
+  assert.doesNotMatch(notice.text, /needs your confirmation/)
+  assert.match(notice.description!, /catalog default model test\/reviewer/)
+})
+
+test("a subagent's notice is routed to the root session and names its origin", async () => {
+  const harness = createHarness({}, async () => { throw new Error("subagent failure") })
+  harness.sessions["ses_test"] = { parentID: "ses_parent", agent: "review", title: "Inspect the fixture" }
+  harness.sessions["ses_parent"] = { agent: "build" }
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "ask")
+  const notices = harness.timelineNotices()
+  assert.equal(notices.length, 1)
+  const notice = notices[0]!
+  assert.equal(notice.sessionID, "ses_parent", "a subagent notice must surface in the root conversation")
+  assert.match(notice.description!, /review subagent/)
+  assert.match(notice.description!, /Inspect the fixture/)
+  assert.match(notice.description!, /reviewer model call failed/)
+})
+
+test("a nested subagent notice still resolves to the top-level session", async () => {
+  const harness = createHarness({}, async () => { throw new Error("nested failure") })
+  harness.sessions["ses_test"] = { parentID: "ses_mid", agent: "explore" }
+  harness.sessions["ses_mid"] = { parentID: "ses_root", agent: "review" }
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "ask")
+  const notices = harness.timelineNotices()
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0]!.sessionID, "ses_root")
+  assert.match(notices[0]!.description!, /explore subagent/)
+})
+
+test("a root session notice needs no origin annotation", async () => {
+  const harness = createHarness({}, async () => { throw new Error("failure") })
+  await harness.setup()
+  assert.equal((await harness.run()).effect, "ask")
+  const notice = harness.timelineNotices()[0]!
+  assert.equal(notice.sessionID, "ses_test")
+  assert.doesNotMatch(notice.description!, /subagent/)
+})
+
+test("a session lookup failure falls back to the reviewed session instead of dropping the notice", async () => {
+  const harness = createHarness({}, async () => { throw new Error("failure") })
+  harness.sessions["ses_test"] = { error: true }
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "ask")
+  const notices = harness.timelineNotices()
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0]!.sessionID, "ses_test")
 })
 
 test("a model fallback is surfaced once in the timeline even for an approval", async () => {
@@ -550,7 +630,7 @@ test("a model fallback is surfaced once in the timeline even for an approval", a
   assert.match((event as any).message, /auto-review fallback/)
   const notices = harness.timelineNotices()
   assert.equal(notices.length, 1)
-  assert.match(notices[0]!.text, /catalog default model test\/reviewer/)
+  assert.match(notices[0]!.description!, /catalog default model test\/reviewer/)
   assert.deepEqual(harness.visibleMessages(), [])
 })
 

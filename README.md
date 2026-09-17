@@ -26,7 +26,7 @@ Choose a reviewer model in `opencode.json(c)`. Replace the example with an avail
 }
 ```
 
-The model is optional: the plugin falls back to the `auto-reviewer` agent's model, then OpenCode's default. Reviewer fallbacks, model-registration failures, exhausted provider errors, and timeouts are shown as messages in the conversation timeline: they scroll with the session and can be reviewed later. They are never queued in the bottom pending inbox, and they do not change the permission decision.
+The model is optional: the plugin falls back to the `auto-reviewer` agent's model, then OpenCode's default. Reviewer fallbacks, model-registration failures, exhausted provider errors, and timeouts are shown as messages in the conversation timeline, with the reason visible in the notice. Notices for a subagent's request are routed to the session you are watching rather than left in the child session. They are never queued in the bottom pending inbox, and they do not change the permission decision.
 
 Automatic review is enabled by default, with **2,048 output tokens** and **90 seconds total per request**. Change these with `maxReviewTokens` and `timeoutMs`. The default output parameter targets Chat Completions; see [advanced configuration](DESIGN.md#configuration) for other APIs and human-only rules.
 

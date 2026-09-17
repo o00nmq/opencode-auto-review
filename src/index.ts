@@ -69,17 +69,84 @@ export default Plugin.define({
     // not a transient toast or a bottom pending-inbox item: it scrolls with the
     // conversation and stays reviewable. `resume: true` (the default) commits the
     // message; `resume: false` would queue it in the inbox instead.
-    const notifyReview = (sessionID: string, action: string, request: string, reason: string): void => {
+    //
+    // Two field policies matter here, and they differ:
+    // - `description` is the only field the TUI paints for a synthetic message
+    //   (OpenCode 2.0.4 renders `message.description` for `type === "synthetic"`),
+    //   so it carries the full human-readable reason.
+    // - `text` is assembled into the model's next request as a user message and
+    //   is replayed on every later turn (verified on 2.0.4), so it stays a short,
+    //   controlled sentence instead of replaying reviewer internals such as
+    //   provider errors or budget limits. An empty `text` is not a way out: it
+    //   still becomes an empty user message. Because it is replayed, it must also
+    //   agree with the permission effect that was actually applied.
+    const notifyReview = (
+      sessionID: string,
+      action: string,
+      request: string,
+      reason: string,
+      effect: "allow" | "deny" | "ask",
+    ): void => {
       if (disposed) return
-      const text = `Auto-review notice (${action}): ${reason.trim()}`
-      diagnose({ action, request, outcome: "notice", reason: text })
-      void ctx.session.synthetic({
-        sessionID,
-        text,
-        description: "Auto-review notice",
-        metadata: { request },
-        resume: true,
-      }).catch((error) => diagnose({ action, request, outcome: "notice_failed", reason: describeError(error) }))
+      const detail = `Auto-review notice (${action}): ${reason.trim()}`
+      // A fallback can accompany a completed verdict, so the sentence follows the
+      // applied effect rather than assuming escalation.
+      const text = effect === "allow"
+        ? `Auto-review approved the pending ${action} request with a reviewer fallback.`
+        : effect === "deny"
+          ? `Auto-review denied the pending ${action} request with a reviewer fallback.`
+          : `Auto-review could not fully verify the pending ${action} request, so it needs your confirmation.`
+      diagnose({ action, request, outcome: "notice", reason: detail })
+      void resolveNoticeSession(sessionID, request)
+        .then((target) => {
+          if (disposed) return
+          return ctx.session.synthetic({
+            sessionID: target.sessionID,
+            text,
+            description: target.origin ? `${detail} (from ${target.origin})` : detail,
+            metadata: { request },
+            resume: true,
+          })
+        })
+        .catch((error) => diagnose({ action, request, outcome: "notice_failed", reason: describeError(error) }))
+    }
+
+    // A subagent runs in its own child session, so a notice posted there never
+    // reaches the conversation the user is watching. Walk the `parentID` chain
+    // (bounded) toward the root session and post there instead, naming the
+    // originating session so the notice stays attributable. Successful lookups are
+    // cached because the chain is stable for a child session's lifetime; failures
+    // are not cached, so a transient lookup error cannot bury every later notice.
+    // Any failure falls back to the reviewed session rather than dropping it.
+    const noticeTargets = new Map<string, { sessionID: string; origin?: string }>()
+    async function resolveNoticeSession(sessionID: string, request: string): Promise<{ sessionID: string; origin?: string }> {
+      const cached = noticeTargets.get(sessionID)
+      if (cached) return cached
+      try {
+        // Name the session whose request actually needed review, not the root.
+        const reviewed = await ctx.session.get({ sessionID })
+        let current = sessionID
+        let parentID = reviewed?.parentID
+        for (let depth = 0; depth < 8 && typeof parentID === "string" && parentID; depth++) {
+          current = parentID
+          parentID = (await ctx.session.get({ sessionID: current }))?.parentID
+        }
+        const target = current === sessionID ? { sessionID } : { sessionID: current, origin: sessionOrigin(reviewed) }
+        if (!disposed) {
+          noticeTargets.set(sessionID, target)
+          if (noticeTargets.size > 256) noticeTargets.delete(noticeTargets.keys().next().value!)
+        }
+        return target
+      } catch (error) {
+        diagnose({ action: "notice_route", request, outcome: "failed", reason: describeError(error) })
+        return { sessionID }
+      }
+    }
+
+    function sessionOrigin(session: { agent?: string; title?: string } | undefined): string {
+      const agent = typeof session?.agent === "string" && session.agent.trim() ? session.agent.trim() : undefined
+      const title = typeof session?.title === "string" && session.title.trim() ? session.title.trim() : undefined
+      return [agent ? `${agent} subagent` : "subagent", title ? `"${title}"` : undefined].filter(Boolean).join(" ")
     }
 
     const commandRegistration = await ctx.command.transform((draft) => {
@@ -143,7 +210,7 @@ export default Plugin.define({
         const outcome = await raceWithAbort(reviewRequest(key, event as PermissionEvent, controller.signal, deadline), controller.signal)
         if (disposed || !enabled || controller.signal.aborted) return
         if (Date.now() >= deadline) {
-          notifyReview(event.sessionID, event.action, key, "Automatic review reached its deadline")
+          notifyReview(event.sessionID, event.action, key, "Automatic review reached its deadline", "ask")
           askHuman(event as PermissionEvent, "Automatic review reached its deadline")
           return
         }
@@ -151,7 +218,9 @@ export default Plugin.define({
         const notices = outcome.notices ?? []
         // Reviewer degradation is surfaced once, in the conversation timeline.
         const degraded = degradationReasons(outcome, notices)
-        if (degraded.length) notifyReview(event.sessionID, event.action, key, degraded.join("; "))
+        if (degraded.length) {
+          notifyReview(event.sessionID, event.action, key, degraded.join("; "), outcome.decision?.decision ?? "ask")
+        }
         if (outcome.decision?.decision === "allow") {
           event.effect = "allow"
           event.message = withNotices(outcome.decision.reason ? `Auto-review approved: ${outcome.decision.reason}` : `Auto-review approved: ${event.action}.`, notices)
@@ -166,7 +235,7 @@ export default Plugin.define({
           const timedOut = aborted && Date.now() >= deadline
           const message = timedOut ? "Automatic review reached its deadline"
             : aborted ? "Automatic review was cancelled" : REVIEWER_FAILURE_MESSAGE
-          if (!aborted || timedOut) notifyReview(event.sessionID, event.action, key, message)
+          if (!aborted || timedOut) notifyReview(event.sessionID, event.action, key, message, "ask")
           askHuman(event as PermissionEvent, message)
         }
       } finally {
@@ -326,6 +395,7 @@ export default Plugin.define({
       for (const controller of activeControllers.keys()) controller.abort()
       reviewerQueue.clear()
       reviewerStates.clear()
+      noticeTargets.clear()
       await registration.dispose()
       await commandRegistration.dispose()
       await promptRegistration.dispose()

@@ -19,7 +19,7 @@ OpenCode V2's `generate.text` is a tool-free generation API. Therefore this plug
 - `review-loop.ts`: assessment → optional investigation → assessment, with immediate terminal verdicts, at most one malformed-output repair, and one recovery attempt for empty output or a failed model call. Recovery shares the original deadline and never executes the pending tool.
 - `response.ts`: strict JSON and decision-matrix validation, including duplicate-key rejection.
 - `rpc.ts`: the shared RPC contract (`status`, `setEnabled`, `state`) used by the server plugin and the TUI.
-- `tui-state.ts`: framework-free controller that owns the TUI's toggle state, syncing it only from confirmed RPC responses and events. It carries no review-notification logic: reviewer degradation is server-authored and timeline-native.
+- `tui-state.ts`: framework-free controller that owns the TUI's toggle state, syncing it only from confirmed RPC responses and events. It carries no review-notification logic: reviewer degradation is server-authored, and the server routes it to the root session's timeline.
 - `model-options.ts`: registers a location-scoped reviewer variant, inheriting the selected native variant and merging request overrides. The default body requests `max_tokens: maxReviewTokens`. Registration is shared across concurrent reviews and disposed on unload.
 - `context-budget.ts`: derives an estimated input-token budget from the selected model's context/input limits and effective output cap, with room for protocol framing and estimation error.
 - `policy.ts`: user-intent and risk rules, evidence protocol, configuration validation.
@@ -63,27 +63,38 @@ The TUI's `tui-state.ts` controller holds the displayed value. It changes that v
 
 Every reviewer notification is presented in the conversation timeline, not as an auto-dismissing toast and not as a bottom pending-inbox item. The server posts a `session.synthetic` message (`resume: true`, the default) scoped to the reviewed `sessionID`; it is committed to the session transcript, so it scrolls with the conversation and remains reviewable. `metadata.request` carries the review request identity so a notice is attributable to the exact request.
 
-Verified against OpenCode 2.0.2: a committed synthetic message appears in the persisted session context, stays out of `/api/session/{id}/inbox`, and is not included in the model's assembled messages on the next turn. It is therefore a display-only timeline notice that neither parks beneath the conversation nor pollutes the model's context. `resume: false` is never used, because that queues the message in the bottom inbox instead.
+When the reviewed request belongs to a subagent, the notice is posted to the **root** session instead: a child session's transcript is not what the user is watching, so a notice left there would be invisible. The plugin walks the `parentID` chain (bounded to 8 hops, so a deeper nest lands on an ancestor rather than the true root) and names the originating session in the notice — for example `(from review subagent "Inspect the fixture")` — so the notice stays attributable inside the main conversation. Successful lookups are cached per reviewed session; failures are not cached, so a transient lookup error cannot bury later notices. If the chain cannot be resolved at all, the notice falls back to the reviewed session rather than being dropped; routing failures are reported through `debug` diagnostics.
+
+A synthetic message has two fields with different reach, and the plugin assigns them deliberately:
+
+| Field | Reaches | Used for |
+| --- | --- | --- |
+| `description` | The timeline only | The full human-readable reason |
+| `text` | The model's next request, every later turn | A short, controlled sentence |
+
+OpenCode 2.0.4 paints only `message.description` for a `type === "synthetic"` message, so the reason must live there to be visible at all. Confirmed against 2.0.4: `text` is assembled into the following model request as a user message and is replayed on every subsequent turn, whereas `description` is display-only. An empty `text` is not an escape hatch, because it still becomes an empty user message. The plugin therefore keeps reviewer internals — provider errors, budget limits, model-fallback notices — in `description` and sends a short sentence in `text` that states the applied verdict (`approved`, `denied`, or `needs your confirmation`). That keeps reviewer diagnostics out of the coding model's context without replaying a statement that contradicts the permission decision.
+
+Verified against OpenCode 2.0.4: a committed synthetic message appears in the persisted session context, stays out of `/api/session/{id}/inbox`, and its `description` is not part of the model's assembled messages. `resume: false` is never used, because that queues the message in the bottom inbox instead.
 
 | Outlet | Presentation |
 | --- | --- |
-| Reviewer failure (empty/invalid output, provider failure, context limit, stalled investigation, incomplete authorization) | Committed timeline notice, plus the unchanged permission message |
+| Reviewer failure (empty/invalid output, provider failure, context limit, stalled investigation, incomplete authorization) | Committed timeline notice (subagent requests route to the root session), plus the unchanged permission message |
 | Model fallback and model-registration failure notices | Committed timeline notice, plus the unchanged permission message |
 | Review deadline / timeout | Committed timeline notice, plus the escalation message |
 | Cancellation, disable, steering | No notice; cancellation cannot produce a late approval |
 | `deny` decision | The permission message becomes the inline denial in the timeline (already timeline-native) |
 | `ask` / human confirmation | The permission prompt names the reason (already timeline-native) |
 | `/auto-review status` output | Committed timeline message, so control output never parks in the inbox |
-| TUI switch result, switch failure, status-query failure | Short toast; the TUI has no timeline slot in 2.0.2, and control feedback is exempt |
+| TUI switch result, switch failure, status-query failure | Short toast; the TUI has no timeline slot, and control feedback is exempt |
 
 Notifications never change permission semantics: the permission `effect` and `message` are computed exactly as before, and a notice is additional timeline information, not a substitute decision. `debug` diagnostics keep the full reason.
 
-This relies on the only host-supported plugin message path in OpenCode 2.0.2: `ctx.session.synthetic`. The TUI slot map (`app`, `home.footer`, `prompt.footer`, `prompt.footer.status`, `prompt.footer.file`, `session.composer.top`, `session.panel`, `sidebar.content`, `sidebar.footer`) contains no session-timeline path, so a plugin cannot render arbitrary timeline entries; a committed synthetic message is the supported mechanism.
+This relies on the only host-supported plugin message path in OpenCode 2.0.4: `ctx.session.synthetic`. The TUI slot map (`app`, `home.footer`, `prompt.footer`, `prompt.footer.status`, `prompt.footer.file`, `session.composer.top`, `session.panel`, `sidebar.content`, `sidebar.footer`) contains no session-timeline path, so a plugin cannot render arbitrary timeline entries; a committed synthetic message is the supported mechanism.
 
 ## Invariants
 
 1. No automatic permission change without a valid terminal decision. An investigation request is never approval.
-2. A failed reviewer is not evidence that the pending operation violates policy. After bounded recovery, failure preserves human confirmation. The failure or fallback reason appears in the permission message, in `debug` diagnostics, and as one committed timeline notice keyed to the review request; it is never queued to the bottom session inbox, and a cancellation or disable produces no notice.
+2. A failed reviewer is not evidence that the pending operation violates policy. After bounded recovery, failure preserves human confirmation. The failure or fallback reason appears in the permission message, in `debug` diagnostics, and as one committed timeline notice keyed to the review request. A subagent's notice is committed to the root session so it is visible; the reviewed child session is still what supplies evidence. The notice is never queued to the bottom session inbox, and a cancellation or disable produces no notice.
 3. Evidence is confined to the retained parent history before the source message. Future user messages, rolled-back calls, and running/pending tool results are not available through evidence lookup.
 4. Tool output cannot establish authorization, even when it contains forged user messages or instructions.
 5. Each round includes previous investigation requests and returned evidence. Subsequent permission requests see retained reviewer outcomes while the journal epoch remains valid.
