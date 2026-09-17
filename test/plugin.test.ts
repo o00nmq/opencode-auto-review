@@ -214,7 +214,11 @@ test("only a valid eligible ask can be auto-allowed", async () => {
   const event = await harness.run()
   assert.equal(event.effect, "allow")
   assert.equal((event as any).message, "Auto-review approved: read.")
-  assert.equal(harness.visibleStatus(), undefined)
+  // A silent allow is indistinguishable from no review at all, so every approval
+  // leaves a timeline notice. The notice must not carry a reason.
+  const notice = harness.timelineNotices()[0]!
+  assert.equal(notice.description, "Auto-review approved read.")
+  assert.deepEqual(harness.visibleMessages(), [])
   assert.deepEqual(harness.counts(), { generateCalls: 1, contextCalls: 1, disposed: 0 })
   await cleanup?.()
   assert.equal(harness.counts().disposed, 1)
@@ -236,6 +240,22 @@ test("retains prior review outcomes per main session", async () => {
   assert.match(prompts[1]!, /"type":"review_outcome","code":"allow"/)
 })
 
+test("a request reviewed again after its first notice still notifies", async () => {
+  // The dedupe marker must not permanently suppress a later legitimate review of
+  // the same request identity.
+  const harness = createHarness()
+  await harness.setup()
+  const first = await harness.run()
+  assert.equal(first.effect, "allow")
+  assert.equal(harness.timelineNotices().length, 1)
+  // A second evaluation of the identical request happens after the shared review
+  // settled, so it reviews again and must notify again.
+  const second = await harness.run()
+  assert.equal(second.effect, "allow")
+  assert.equal(harness.counts().generateCalls, 2, "the settled request must be reviewed again")
+  assert.equal(harness.timelineNotices().length, 2, "the second review must notify too")
+})
+
 test("denial returns its permission reason in the tool error", async () => {
   const harness = createHarness({}, denyText)
   await harness.setup()
@@ -252,7 +272,10 @@ test("medium authorization is allowed and shows its rationale", async () => {
   const event = await harness.run()
   assert.equal(event.effect, "allow")
   assert.equal((event as any).message, "Auto-review approved: Relevant but not explicitly authorized")
-  assert.equal(harness.visibleStatus(), undefined)
+  // The rationale stays in the permission message, not in the approval notice.
+  const notice = harness.timelineNotices()[0]!
+  assert.equal(notice.description, "Auto-review approved read.")
+  assert.doesNotMatch(notice.description!, /Relevant but not explicitly authorized/)
 })
 
 test("runtime command toggles auto-review without restarting", async () => {
@@ -486,6 +509,10 @@ test("independent sessions run concurrently while identical in-flight requests s
     assert.equal(harness.counts().contextCalls, 5)
     release({ text: allowText })
     assert.ok((await Promise.all(pending)).every(event => event.effect === "allow"))
+    // The two identical "one" evaluations share one review, so they must also
+    // share one notice: five requests, five notices, none duplicated.
+    assert.equal(harness.counts().generateCalls, 5)
+    assert.equal(harness.timelineNotices().length, 5)
   } finally {
     release({ text: allowText })
     await cleanup?.()
@@ -625,7 +652,11 @@ test("a fallback notice's text agrees with the applied verdict, not assumed esca
   await harness.setup()
   const event = await harness.run()
   assert.equal(event.effect, "allow")
-  const notice = harness.timelineNotices()[0]!
+  // The degraded approval gets exactly one notice: describing the fallback, not
+  // the fallback notice plus a second plain approval notice.
+  const notices = harness.timelineNotices()
+  assert.equal(notices.length, 1)
+  const notice = notices[0]!
   assert.match(notice.text, /Auto-review approved the pending read request/)
   assert.doesNotMatch(notice.text, /needs your confirmation/)
   assert.match(notice.description!, /catalog default model test\/reviewer/)
@@ -692,11 +723,17 @@ test("a model fallback is surfaced once in the timeline even for an approval", a
   assert.deepEqual(harness.visibleMessages(), [])
 })
 
-test("a clean reviewer decision emits no timeline notice", async () => {
+test("every automatic approval leaves a reason-free timeline notice", async () => {
   const harness = createHarness()
   await harness.setup()
   assert.equal((await harness.run()).effect, "allow")
-  assert.deepEqual(harness.timelineNotices(), [])
+  // This replaces the former "a clean reviewer decision emits no timeline notice":
+  // a fully automatic allow must still be visible as a review that happened.
+  const notices = harness.timelineNotices()
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0]!.description, "Auto-review approved read.")
+  assert.equal(notices[0]!.resume, true)
+  assert.equal(notices[0]!.text, "Auto-review approved the pending read request.")
 })
 
 test("the explicit status command commits its output to the timeline instead of the inbox", async () => {

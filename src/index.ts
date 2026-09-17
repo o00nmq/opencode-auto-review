@@ -65,21 +65,61 @@ export default Plugin.define({
       void rpcRegistration.events.emit("state", { enabled: value }).catch(() => undefined)
     }
 
-    // Reviewer degradation is reported as a committed session timeline message,
-    // not a transient toast or a bottom pending-inbox item: it scrolls with the
-    // conversation and stays reviewable. `resume: true` (the default) commits the
+    // Reviewer notifications are committed session timeline messages, not
+    // transient toasts or bottom pending-inbox items: they scroll with the
+    // conversation and stay reviewable. `resume: true` (the default) commits the
     // message; `resume: false` would queue it in the inbox instead.
     //
     // Two field policies matter here, and they differ:
     // - `description` is the only field the TUI paints for a synthetic message
     //   (OpenCode 2.0.4 renders `message.description` for `type === "synthetic"`),
-    //   so it carries the full human-readable reason.
+    //   so it carries the human-readable text.
     // - `text` is assembled into the model's next request as a user message and
     //   is replayed on every later turn (verified on 2.0.4), so it stays a short,
     //   controlled sentence instead of replaying reviewer internals such as
     //   provider errors or budget limits. An empty `text` is not a way out: it
     //   still becomes an empty user message. Because it is replayed, it must also
     //   agree with the permission effect that was actually applied.
+    // Concurrent identical evaluations share one review (see `reviewRequest`), so
+    // they must also share one notice. Keyed by request identity, and cleared when
+    // the shared review settles so a later legitimate review still notifies.
+    const notified = new Set<string>()
+
+    const postNotice = (request: string, text: string, description: string, sessionID: string): void => {
+      if (disposed) return
+      if (notified.has(request)) return
+      notified.add(request)
+      // Bound the marker set; request identities are unique per evaluation and a
+      // stale marker only matters until that request is reviewed again.
+      if (notified.size > 512) notified.delete(notified.values().next().value!)
+      void resolveNoticeSession(sessionID, request)
+        .then((target) => {
+          if (disposed) return
+          return ctx.session.synthetic({
+            sessionID: target.sessionID,
+            text,
+            description: target.origin ? `${description} (from ${target.origin})` : description,
+            metadata: { request },
+            resume: true,
+          })
+        })
+        .catch((error) => diagnose({ action: "notice", request, outcome: "notice_failed", reason: describeError(error) }))
+    }
+
+    // Every automatic approval leaves a trace: a silent allow is indistinguishable
+    // from no review at all. The notice deliberately carries no reason, so an
+    // ordinary approval cannot be mistaken for a considered risk judgement. The
+    // permission message keeps whatever rationale the reviewer supplied.
+    const notifyApproval = (sessionID: string, action: string, request: string): void => {
+      diagnose({ action, request, outcome: "notice_approved" })
+      postNotice(
+        request,
+        `Auto-review approved the pending ${action} request.`,
+        `Auto-review approved ${action}.`,
+        sessionID,
+      )
+    }
+
     const notifyReview = (
       sessionID: string,
       action: string,
@@ -87,7 +127,6 @@ export default Plugin.define({
       reason: string,
       effect: "allow" | "deny" | "ask",
     ): void => {
-      if (disposed) return
       const detail = `Auto-review notice (${action}): ${reason.trim()}`
       // A fallback can accompany a completed verdict, so the sentence follows the
       // applied effect rather than assuming escalation.
@@ -97,18 +136,7 @@ export default Plugin.define({
           ? `Auto-review denied the pending ${action} request with a reviewer fallback.`
           : `Auto-review could not fully verify the pending ${action} request, so it needs your confirmation.`
       diagnose({ action, request, outcome: "notice", reason: detail })
-      void resolveNoticeSession(sessionID, request)
-        .then((target) => {
-          if (disposed) return
-          return ctx.session.synthetic({
-            sessionID: target.sessionID,
-            text,
-            description: target.origin ? `${detail} (from ${target.origin})` : detail,
-            metadata: { request },
-            resume: true,
-          })
-        })
-        .catch((error) => diagnose({ action, request, outcome: "notice_failed", reason: describeError(error) }))
+      postNotice(request, text, detail, sessionID)
     }
 
     // A subagent runs in its own child session, so a notice posted there never
@@ -218,15 +246,23 @@ export default Plugin.define({
         const notices = outcome.notices ?? []
         // Reviewer degradation is surfaced once, in the conversation timeline.
         const degraded = degradationReasons(outcome, notices)
-        if (degraded.length) {
-          notifyReview(event.sessionID, event.action, key, degraded.join("; "), outcome.decision?.decision ?? "ask")
-        }
-        if (outcome.decision?.decision === "allow") {
+        // Derive the applied effect first so the notice wording can never disagree
+        // with what the permission actually did.
+        const applied: "allow" | "deny" | "ask" =
+          outcome.decision?.decision === "allow" ? "allow"
+            : outcome.decision?.decision === "deny" ? "deny"
+              : "ask"
+        if (applied === "allow") {
+          // A degraded approval already gets one notice describing the fallback, so
+          // it must not also emit the plain approval notice.
+          if (degraded.length) notifyReview(event.sessionID, event.action, key, degraded.join("; "), "allow")
+          else notifyApproval(event.sessionID, event.action, key)
           event.effect = "allow"
-          event.message = withNotices(outcome.decision.reason ? `Auto-review approved: ${outcome.decision.reason}` : `Auto-review approved: ${event.action}.`, notices)
+          event.message = withNotices(outcome.decision!.reason ? `Auto-review approved: ${outcome.decision!.reason}` : `Auto-review approved: ${event.action}.`, notices)
           return
         }
-        if (outcome.decision?.decision === "deny") denyPolicy(event as PermissionEvent, outcome.decision.reason ?? FAILURE_MESSAGE, notices)
+        if (degraded.length) notifyReview(event.sessionID, event.action, key, degraded.join("; "), applied)
+        if (applied === "deny") denyPolicy(event as PermissionEvent, outcome.decision!.reason ?? FAILURE_MESSAGE, notices)
         else askHuman(event as PermissionEvent, outcome.decision?.reason ?? outcome.message ?? REVIEWER_FAILURE_MESSAGE, notices)
       } catch {
         if (!disposed) {
@@ -247,6 +283,11 @@ export default Plugin.define({
     function reviewRequest(key: string, event: PermissionEvent, signal: AbortSignal, deadline: number): Promise<ReviewOutcome> {
       const existing = inFlight.get(key)
       if (existing) return existing
+      // A fresh review for this request identity may notify again; the previous
+      // notice for the same identity must not suppress it. Concurrent evaluations
+      // of one request still share the single notice, because they join the review
+      // created here instead of clearing this marker.
+      notified.delete(key)
       const review = reviewerQueue.run(event.sessionID, signal, async (): Promise<ReviewOutcome> => {
         const loaded = await loadReviewRequest(event, signal)
         if (!loaded) return { code: "incomplete_request", message: "Automatic review could not identify the complete tool request" }
@@ -408,6 +449,7 @@ export default Plugin.define({
       reviewerQueue.clear()
       reviewerStates.clear()
       noticeTargets.clear()
+      notified.clear()
       await registration.dispose()
       await commandRegistration.dispose()
       await promptRegistration.dispose()

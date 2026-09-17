@@ -53,7 +53,7 @@ inputBudget = max(0, floor(available * 0.9) - 256)
 
 The output reserve uses effective model/variant body caps, falling back to `limit.output`. ASCII word/whitespace runs are estimated at three characters per token; punctuation and non-ASCII text use UTF-8 byte count. This is an approximation, with 10% margin and 256 tokens for framing. Initial context uses 75% of the resulting budget, leaving space for investigation.
 
-Evidence capture continues while the plugin is loaded, including when automatic review is toggled off. Original sources persist in plugin storage; up to 128 review journals are retained in memory. Review notifications are committed as session timeline messages (see below); only reviewer degradation produces one, so ordinary approvals stay quiet.
+Evidence capture continues while the plugin is loaded, including when automatic review is toggled off. Original sources persist in plugin storage; up to 128 review journals are retained in memory. Review notifications are committed as session timeline messages (see below). Every automatic approval attempts a notice, so a silent allow is not mistaken for no review at all; reviewer degradation replaces that notice with one that names the fallback. Concurrent evaluations of one request share a single review and therefore a single notice. Delivery is best-effort: a rejected `session.synthetic` call is reported through `debug` diagnostics only, and a notice is never allowed to change the permission decision.
 
 ## Runtime toggle and TUI synchronization
 
@@ -71,17 +71,18 @@ A synthetic message has two fields with different reach, and the plugin assigns 
 
 | Field | Reaches | Used for |
 | --- | --- | --- |
-| `description` | The timeline only | The full human-readable reason |
-| `text` | The model's next request, every later turn | A short, controlled sentence |
+| `description` | The timeline only | Human-readable notice text: the diagnostic reason for failures and fallbacks, and a reason-free statement for approvals |
+| `text` | The model's next request, every later turn | A short, controlled sentence stating the applied verdict |
 
-OpenCode 2.0.4 paints only `message.description` for a `type === "synthetic"` message, so the reason must live there to be visible at all. Confirmed against 2.0.4: `text` is assembled into the following model request as a user message and is replayed on every subsequent turn, whereas `description` is display-only. An empty `text` is not an escape hatch, because it still becomes an empty user message. The plugin therefore keeps reviewer internals — provider errors, budget limits, model-fallback notices — in `description` and sends a short sentence in `text` that states the applied verdict (`approved`, `denied`, or `needs your confirmation`). That keeps reviewer diagnostics out of the coding model's context without replaying a statement that contradicts the permission decision.
+OpenCode 2.0.4 paints only `message.description` for a `type === "synthetic"` message, so notice text must live there to be visible at all. Confirmed against 2.0.4: `text` is assembled into the following model request as a user message and is replayed on every subsequent turn, whereas `description` is display-only. An empty `text` is not an escape hatch, because it still becomes an empty user message. The plugin therefore keeps reviewer internals — provider errors, budget limits, model-fallback details — in `description` and sends a short sentence in `text` that states the applied verdict (`approved`, `denied`, or `needs your confirmation`). An approval notice carries no reviewer rationale in either field, so it cannot be read as a considered risk judgement. That keeps reviewer diagnostics out of the coding model's context without replaying a statement that contradicts the permission decision.
 
 Verified against OpenCode 2.0.4: a committed synthetic message appears in the persisted session context, stays out of `/api/session/{id}/inbox`, and its `description` is not part of the model's assembled messages. `resume: false` is never used, because that queues the message in the bottom inbox instead.
 
 | Outlet | Presentation |
 | --- | --- |
+| `allow` decision | Committed timeline notice naming the approved action, with no reason, so the approval is visible without implying a risk judgement |
 | Reviewer failure (empty/invalid output, provider failure, context limit, stalled investigation, incomplete authorization) | Committed timeline notice (subagent requests route to the root session), plus the unchanged permission message |
-| Model fallback and model-registration failure notices | Committed timeline notice, plus the unchanged permission message |
+| Model fallback and model-registration failure notices | Committed timeline notice, replacing the plain approval notice when the verdict is `allow`, plus the unchanged permission message |
 | Review deadline / timeout | Committed timeline notice, plus the escalation message |
 | Cancellation, disable, steering | No notice; cancellation cannot produce a late approval |
 | `deny` decision | The permission message becomes the inline denial in the timeline (already timeline-native) |
