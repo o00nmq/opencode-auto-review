@@ -66,20 +66,38 @@ function createHarness(
   const catalogModel: any = { providerID: "test", id: "reviewer", limit: { context: 128_000, input: 120_000, output: 8192 }, variants: [
     { id: "max", settings: { reasoningEffort: "high" }, body: { reasoning: { effort: "high" } } },
   ] }
-  const defaultCatalog = {
-    model: {
+  const defaultCatalog = (() => {
+    // Model the 2.0.4 registry faithfully: transforms are replayed lazily on the
+    // next read, not when `transform()` resolves. A synchronous mock would hide a
+    // registration that never actually runs.
+    let retained: { callback: (editor: any) => void; before: any[] } | undefined
+    const editor = () => ({
+      get: (provider: string, id: string) => provider === catalogModel.providerID && id === catalogModel.id ? catalogModel : undefined,
+      update: (_provider: string, _id: string, update: (draft: any) => void) => update(catalogModel),
+    })
+    const replay = () => {
+      if (!retained) return
+      catalogModel.variants = structuredClone(retained.before)
+      retained.callback(editor())
+    }
+    return {
       default: async () => ({ data: catalogModel }),
-      list: async () => ({ data: [catalogModel] }),
-    },
-    transform: async (callback: (editor: any) => void) => {
-      const before = structuredClone(catalogModel.variants)
-      callback({ model: {
-        get: (provider: string, id: string) => provider === catalogModel.providerID && id === catalogModel.id ? catalogModel : undefined,
-        update: (_provider: string, _id: string, update: (draft: any) => void) => update(catalogModel),
-      } })
-      return { dispose: async () => { catalogModel.variants = before } }
-    },
-  }
+      list: async () => { replay(); return { data: [catalogModel] } },
+      transform: async (callback: (editor: any) => void) => {
+        const before = structuredClone(catalogModel.variants)
+        retained = { callback, before }
+        return {
+          dispose: async () => {
+            retained = undefined
+            catalogModel.variants = structuredClone(before)
+          },
+        }
+      },
+    }
+  })()
+  // OpenCode 2.0.4 exposes the model domain directly on the plugin context and
+  // flattens the transform editor (`editor.get`/`editor.update`), replacing
+  // 2.0.2's `ctx.catalog.model` nesting.
   const ctx = {
     options: pluginOptions,
     storage: (() => {
@@ -123,7 +141,7 @@ function createHarness(
       return { text: generate }
     } },
     agent: { get: async () => { throw new Error("missing") } },
-    catalog: catalogOverride ?? defaultCatalog,
+    model: { ...(catalogOverride ?? defaultCatalog) },
     rpc: {
       register: async (_definition: unknown, handlers: Record<string, (input: any, context: any) => Promise<unknown>>) => {
         rpcHandlers = handlers
@@ -474,17 +492,48 @@ test("independent sessions run concurrently while identical in-flight requests s
   }
 })
 
+test("a hung verification read does not permanently wedge shared reviewer-model setup", async () => {
+  // The host adapter cannot cancel a registry read, so a read that never settles
+  // must still release the shared model initialization; otherwise every later
+  // review would wait on the same stuck promise. The registry is modeled as lazy
+  // (2.0.4+): `transform` does not run its callback, a read does.
+  const selected: any = { providerID: "test", id: "reviewer", limit: { context: 128_000, output: 8192 }, variants: [], body: { max_tokens: 4096 } }
+  let hang = true
+  let verifications = 0
+  let retained: ((editor: any) => void) | undefined
+  const modelDomain = {
+    transform: async (callback: (editor: any) => void) => {
+      retained = callback
+      return { dispose: async () => { retained = undefined; selected.variants = [] } }
+    },
+    list: () => {
+      verifications++
+      if (hang) return new Promise(() => undefined)
+      retained?.({ get: () => selected, update: (_p: string, _m: string, update: (draft: any) => void) => update(selected) })
+      return Promise.resolve({ data: [selected] })
+    },
+    default: async () => ({ data: selected }),
+  }
+  const harness = createHarness({ timeoutMs: 1000, modelOptions: { body: { max_tokens: 512 } } }, allowText, undefined, modelDomain)
+  await harness.setup()
+  assert.equal((await harness.run({ sessionID: "one" })).effect, "ask", "a stalled verification must not approve")
+  hang = false
+  await new Promise((done) => setImmediate(done))
+  assert.equal((await harness.run({ sessionID: "two" })).effect, "allow", "a later review must retry instead of reusing the stuck promise")
+  assert.ok(verifications >= 2, "the retry must issue its own verification read")
+})
+
 test("plugin modelOptions select a derived variant once across concurrent reviews and dispose it", async () => {
   const selected: any = { providerID: "test", id: "reviewer", limit: { context: 128_000, output: 8192 }, variants: [], body: { max_tokens: 4096 } }
   let registrations = 0
   let disposals = 0
-  const catalog = {
+  const modelDomain = {
     transform: async (callback: (editor: any) => void) => {
       registrations++
-      callback({ model: { get: () => selected, update: (_p: string, _m: string, update: (draft: any) => void) => update(selected) } })
+      callback({ get: () => selected, update: (_p: string, _m: string, update: (draft: any) => void) => update(selected) })
       return { dispose: async () => { disposals++; selected.variants = [] } }
     },
-    model: { list: async () => ({ data: [selected] }) },
+    list: async () => ({ data: [selected] }),
   }
   const harness = createHarness({ modelOptions: { body: { max_tokens: 512 } } }, async (input) => {
     assert.equal(input.body, undefined, "unsupported generate fields must not be sent")
@@ -492,7 +541,7 @@ test("plugin modelOptions select a derived variant once across concurrent review
     assert.equal(selected.variants[0].body.max_tokens, 512)
     assert.equal(selected.body.max_tokens, 4096)
     return { text: allowText }
-  }, undefined, catalog)
+  }, undefined, modelDomain)
   const cleanup = await harness.setup()
   const results = await Promise.all([harness.run({ sessionID: "one" }), harness.run({ sessionID: "two" })])
   assert.ok(results.every((event) => event.effect === "allow"))

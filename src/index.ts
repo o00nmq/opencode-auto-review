@@ -273,7 +273,7 @@ export default Plugin.define({
         return { code: "model_unavailable", message: "Automatic review could not resolve a reviewer model", notices }
       }
       const selectedModel = resolved.model
-      const catalog = await raceWithAbort(ctx.catalog.model.list({}, { signal }), signal)
+      const catalog = await raceWithAbort(ctx.model.list({}, { signal }), signal)
       const info = catalog.data.find((item) => item.providerID === selectedModel.providerID && item.id === selectedModel.id)
       const variant = info?.variants.find((item) => item.id === selectedModel.variant)
       const maxInputTokens = inputTokenBudget(info?.limit, { ...info?.body, ...variant?.body })
@@ -327,17 +327,29 @@ export default Plugin.define({
         const notices: string[] = []
         const selected = await resolveModel(ctx, options.agent, options.model, options.timeoutMs, modelController.signal, notices)
         if (!selected || disposed || !options.modelOptions) return { model: selected, notices }
-        const registered = await registerModelOptions(ctx.catalog, selected, options.modelOptions)
-        if ("error" in registered) {
-          notices.push(registered.error)
-          return { model: undefined, notices }
+        // Registration verification issues a registry read that the host cannot
+        // cancel, so bound it: a read that never settles must not leave the shared
+        // `pendingModel` promise unresolved, which would wedge every later review.
+        const controller = new AbortController()
+        const onParentAbort = () => controller.abort()
+        modelController.signal.addEventListener("abort", onParentAbort, { once: true })
+        const timer = setTimeout(() => controller.abort(), options.timeoutMs)
+        try {
+          const registered = await registerModelOptions(ctx.model, selected, options.modelOptions, controller.signal)
+          if ("error" in registered) {
+            notices.push(registered.error)
+            return { model: undefined, notices }
+          }
+          if (disposed) {
+            await registered.dispose()
+            return { model: undefined, notices }
+          }
+          modelRegistration = registered
+          return { model: registered.model, notices }
+        } finally {
+          clearTimeout(timer)
+          modelController.signal.removeEventListener("abort", onParentAbort)
         }
-        if (disposed) {
-          await registered.dispose()
-          return { model: undefined, notices }
-        }
-        modelRegistration = registered
-        return { model: registered.model, notices }
       })()
       try {
         const resolved = await pending
@@ -501,7 +513,7 @@ async function resolveModel(
     }
     if (controller.signal.aborted) return
     try {
-      const fallback = await raceWithAbort(ctx.catalog.model.default({}, { signal: controller.signal }), controller.signal)
+      const fallback = await raceWithAbort(ctx.model.default({}, { signal: controller.signal }), controller.signal)
       if (fallback.data) {
         notices.push(`no reviewer model configured; using the catalog default model ${fallback.data.providerID}/${fallback.data.id}`)
         return copyModel(fallback.data)

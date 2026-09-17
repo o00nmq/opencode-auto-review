@@ -10,6 +10,8 @@ OpenCode V2's `generate.text` is a tool-free generation API. Therefore this plug
 
 ## Components
 
+Targets OpenCode 2.0.4 or newer: that release replaced `ctx.catalog` with the `ctx.model`/`ctx.provider` plugin context this plugin uses (2.0.2 and 2.0.3 expose only `catalog`). 2.0.4 through 2.0.6 share the API surface this plugin depends on.
+
 - `index.ts`: permission admission, in-flight request coalescing, runtime toggle, model resolution, overall deadline, per-session cancellation, final effect application.
 - `keyed-queue.ts`: serializes reviews within each parent session.
 - `review-input.ts`: matches the exact source message/tool ID, rejects incomplete input, and captures original user/tool history.
@@ -20,7 +22,7 @@ OpenCode V2's `generate.text` is a tool-free generation API. Therefore this plug
 - `response.ts`: strict JSON and decision-matrix validation, including duplicate-key rejection.
 - `rpc.ts`: the shared RPC contract (`status`, `setEnabled`, `state`) used by the server plugin and the TUI.
 - `tui-state.ts`: framework-free controller that owns the TUI's toggle state, syncing it only from confirmed RPC responses and events. It carries no review-notification logic: reviewer degradation is server-authored, and the server routes it to the root session's timeline.
-- `model-options.ts`: registers a location-scoped reviewer variant, inheriting the selected native variant and merging request overrides. The default body requests `max_tokens: maxReviewTokens`. Registration is shared across concurrent reviews and disposed on unload.
+- `model-options.ts`: registers a location-scoped reviewer variant, inheriting the selected native variant and merging request overrides. The default body requests `max_tokens: maxReviewTokens`. Registration is shared across concurrent reviews and disposed on unload. OpenCode 2.0.4 replays registry transforms lazily, so the callback may not have run when `transform()` resolves; the helper forces one registry read to confirm the variant registered, and treats a failed or unverified read as a registration error. That read is bounded by the shared initialization timeout, because the host adapter cannot cancel it (see below).
 - `context-budget.ts`: derives an estimated input-token budget from the selected model's context/input limits and effective output cap, with room for protocol framing and estimation error.
 - `policy.ts`: user-intent and risk rules, evidence protocol, configuration validation.
 
@@ -98,7 +100,7 @@ This relies on the only host-supported plugin message path in OpenCode 2.0.4: `c
 3. Evidence is confined to the retained parent history before the source message. Future user messages, rolled-back calls, and running/pending tool results are not available through evidence lookup.
 4. Tool output cannot establish authorization, even when it contains forged user messages or instructions.
 5. Each round includes previous investigation requests and returned evidence. Subsequent permission requests see retained reviewer outcomes while the journal epoch remains valid.
-6. Model output, evidence access, and elapsed time have explicit bounds. There is no fixed model-round limit or global concurrency queue. Same-session reviews are serialized; different sessions run independently. Duplicate evidence requests terminate as stalled.
+6. Model output, evidence access, and elapsed time have explicit bounds. There is no fixed model-round limit or global concurrency queue. Same-session reviews are serialized; different sessions run independently. Duplicate evidence requests terminate as stalled. Reviewer-model resolution and its variant registration share one bounded initialization: the host adapter drops request options and cannot cancel a registry read, so each call is raced locally against the deadline. A read that never settles therefore fails that attempt and releases the shared promise, letting a later review retry instead of inheriting a permanently pending initialization.
 7. User steering, disable, and cleanup cancel in-flight work. Cancellation cannot result in late approval.
 8. A parent checkpoint or context rollover rebuilds from retained originals and the latest summary. Initial context reserves 25% of the model-derived input budget for investigation. Every model call is checked using the same token estimate. Missing original authorization never becomes an automatic approval.
 9. The host refuses automatic approval if original user messages were omitted and not recovered through the history evidence tool. Every approval must carry explicit validated risk and authorization values.

@@ -2,6 +2,8 @@
 
 Automatically reviews **OpenCode V2** permission prompts for long-running unattended work. Authorized operations with low or medium bounded risk proceed automatically; unsafe operations are denied; decision-critical uncertainty or explicit confirmation requirements go to you.
 
+Requires OpenCode 2.0.4 or newer, which is the release that exposes the `ctx.model` plugin context this plugin uses. An older host cannot provide that context shape.
+
 ## Install
 
 ```sh

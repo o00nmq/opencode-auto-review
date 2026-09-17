@@ -12,10 +12,11 @@ function catalog() {
   let transform: ((editor: any) => void) | undefined
   const replay = () => {
     current = structuredClone(source)
-    transform?.({ model: {
+    // 2.0.4 flattens the model editor: `editor.get`/`editor.update`.
+    transform?.({
       get: (provider: string, id: string) => provider === "p" && id === "m" ? current : undefined,
       update: (_provider: string, _id: string, update: (draft: any) => void) => update(current),
-    } })
+    })
   }
   const api = {
     transform: async (callback: (editor: any) => void) => {
