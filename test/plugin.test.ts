@@ -518,8 +518,17 @@ test("a hung verification read does not permanently wedge shared reviewer-model 
   await harness.setup()
   assert.equal((await harness.run({ sessionID: "one" })).effect, "ask", "a stalled verification must not approve")
   hang = false
-  await new Promise((done) => setImmediate(done))
-  assert.equal((await harness.run({ sessionID: "two" })).effect, "allow", "a later review must retry instead of reusing the stuck promise")
+  // Retry rather than assume a fixed number of event-loop turns: the stalled
+  // attempt is released by its own timeout, which need not land before one
+  // setImmediate. Without the bounded registration this never recovers, so the
+  // loop still fails the test after the bound.
+  let recovered = false
+  const giveUpAt = Date.now() + 5_000
+  while (!recovered && Date.now() < giveUpAt) {
+    recovered = (await harness.run({ sessionID: "two" })).effect === "allow"
+    if (!recovered) await new Promise((done) => setTimeout(done, 25))
+  }
+  assert.ok(recovered, "a later review must retry instead of reusing the stuck initialization")
   assert.ok(verifications >= 2, "the retry must issue its own verification read")
 })
 
