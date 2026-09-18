@@ -70,7 +70,7 @@ for (const fixture of cases) {
     lines: journal.lines, evidence: captureEvidence(messages, event), options, maxInputTokens, signal, deadline,
     generate: async (prompt, timeoutMs) => {
       rounds++
-      const { stdout } = await exec("opencode2", ["api", "post", "/api/generate", "--data", JSON.stringify({ prompt, model })], {
+      const { stdout } = await exec("opencode2", ["api", "post", "/api/experimental/generate", "--data", JSON.stringify({ prompt, model })], {
         signal, timeout: timeoutMs, maxBuffer: 1_048_576,
       })
       const response = JSON.parse(stdout)
