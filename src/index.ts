@@ -72,20 +72,20 @@ export default Plugin.define({
     //
     // Two field policies matter here, and they differ:
     // - `description` is the only field the TUI paints for a synthetic message
-    //   (OpenCode 2.0.4 renders `message.description` for `type === "synthetic"`),
-    //   so it carries the human-readable text.
-    // - `text` is assembled into the model's next request as a user message and
-    //   is replayed on every later turn (verified on 2.0.4), so it stays a short,
-    //   controlled sentence instead of replaying reviewer internals such as
-    //   provider errors or budget limits. An empty `text` is not a way out: it
-    //   still becomes an empty user message. Because it is replayed, it must also
-    //   agree with the permission effect that was actually applied.
+    //   (OpenCode 2.0.4+ renders `message.description` for `type === "synthetic"`),
+    //   so it carries all human-readable text.
+    // - `text` is assembled into the model's next request as a user message, so it
+    //   is deliberately empty: the host drops an empty synthetic body from the
+    //   request entirely (verified on 2.0.6), which makes the notice visible to the
+    //   user without telling the coding model that a permission was reviewed or
+    //   approved. A non-empty `text` would be replayed on every later turn.
+    //
     // Concurrent identical evaluations share one review (see `reviewRequest`), so
     // they must also share one notice. Keyed by request identity, and cleared when
-    // the shared review settles so a later legitimate review still notifies.
+    // a fresh review starts so a later legitimate review still notifies.
     const notified = new Set<string>()
 
-    const postNotice = (request: string, text: string, description: string, sessionID: string): void => {
+    const postNotice = (request: string, description: string, sessionID: string): void => {
       if (disposed) return
       if (notified.has(request)) return
       notified.add(request)
@@ -97,7 +97,7 @@ export default Plugin.define({
           if (disposed) return
           return ctx.session.synthetic({
             sessionID: target.sessionID,
-            text,
+            text: "",
             description: target.origin ? `${description} (from ${target.origin})` : description,
             metadata: { request },
             resume: true,
@@ -112,12 +112,7 @@ export default Plugin.define({
     // permission message keeps whatever rationale the reviewer supplied.
     const notifyApproval = (sessionID: string, action: string, request: string): void => {
       diagnose({ action, request, outcome: "notice_approved" })
-      postNotice(
-        request,
-        `Auto-review approved the pending ${action} request.`,
-        `Auto-review approved ${action}.`,
-        sessionID,
-      )
+      postNotice(request, `Auto-review approved ${action}.`, sessionID)
     }
 
     const notifyReview = (
@@ -125,18 +120,10 @@ export default Plugin.define({
       action: string,
       request: string,
       reason: string,
-      effect: "allow" | "deny" | "ask",
     ): void => {
       const detail = `Auto-review notice (${action}): ${reason.trim()}`
-      // A fallback can accompany a completed verdict, so the sentence follows the
-      // applied effect rather than assuming escalation.
-      const text = effect === "allow"
-        ? `Auto-review approved the pending ${action} request with a reviewer fallback.`
-        : effect === "deny"
-          ? `Auto-review denied the pending ${action} request with a reviewer fallback.`
-          : `Auto-review could not fully verify the pending ${action} request, so it needs your confirmation.`
       diagnose({ action, request, outcome: "notice", reason: detail })
-      postNotice(request, text, detail, sessionID)
+      postNotice(request, detail, sessionID)
     }
 
     // A subagent runs in its own child session, so a notice posted there never
@@ -238,7 +225,7 @@ export default Plugin.define({
         const outcome = await raceWithAbort(reviewRequest(key, event as PermissionEvent, controller.signal, deadline), controller.signal)
         if (disposed || !enabled || controller.signal.aborted) return
         if (Date.now() >= deadline) {
-          notifyReview(event.sessionID, event.action, key, "Automatic review reached its deadline", "ask")
+          notifyReview(event.sessionID, event.action, key, "Automatic review reached its deadline")
           askHuman(event as PermissionEvent, "Automatic review reached its deadline")
           return
         }
@@ -246,23 +233,17 @@ export default Plugin.define({
         const notices = outcome.notices ?? []
         // Reviewer degradation is surfaced once, in the conversation timeline.
         const degraded = degradationReasons(outcome, notices)
-        // Derive the applied effect first so the notice wording can never disagree
-        // with what the permission actually did.
-        const applied: "allow" | "deny" | "ask" =
-          outcome.decision?.decision === "allow" ? "allow"
-            : outcome.decision?.decision === "deny" ? "deny"
-              : "ask"
-        if (applied === "allow") {
+        if (outcome.decision?.decision === "allow") {
           // A degraded approval already gets one notice describing the fallback, so
           // it must not also emit the plain approval notice.
-          if (degraded.length) notifyReview(event.sessionID, event.action, key, degraded.join("; "), "allow")
+          if (degraded.length) notifyReview(event.sessionID, event.action, key, degraded.join("; "))
           else notifyApproval(event.sessionID, event.action, key)
           event.effect = "allow"
-          event.message = withNotices(outcome.decision!.reason ? `Auto-review approved: ${outcome.decision!.reason}` : `Auto-review approved: ${event.action}.`, notices)
+          event.message = withNotices(outcome.decision.reason ? `Auto-review approved: ${outcome.decision.reason}` : `Auto-review approved: ${event.action}.`, notices)
           return
         }
-        if (degraded.length) notifyReview(event.sessionID, event.action, key, degraded.join("; "), applied)
-        if (applied === "deny") denyPolicy(event as PermissionEvent, outcome.decision!.reason ?? FAILURE_MESSAGE, notices)
+        if (degraded.length) notifyReview(event.sessionID, event.action, key, degraded.join("; "))
+        if (outcome.decision?.decision === "deny") denyPolicy(event as PermissionEvent, outcome.decision.reason ?? FAILURE_MESSAGE, notices)
         else askHuman(event as PermissionEvent, outcome.decision?.reason ?? outcome.message ?? REVIEWER_FAILURE_MESSAGE, notices)
       } catch {
         if (!disposed) {
@@ -271,7 +252,7 @@ export default Plugin.define({
           const timedOut = aborted && Date.now() >= deadline
           const message = timedOut ? "Automatic review reached its deadline"
             : aborted ? "Automatic review was cancelled" : REVIEWER_FAILURE_MESSAGE
-          if (!aborted || timedOut) notifyReview(event.sessionID, event.action, key, message, "ask")
+          if (!aborted || timedOut) notifyReview(event.sessionID, event.action, key, message)
           askHuman(event as PermissionEvent, message)
         }
       } finally {

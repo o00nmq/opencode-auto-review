@@ -638,16 +638,12 @@ test("reviewer degradation is reported as a committed timeline notice, not an in
   // The timeline paints `description`, so the reason must live there.
   assert.match(notice.description!, /reviewer model call failed/)
   assert.match(notice.description!, /provider secret/)
-  // `text` enters the model's context on every turn, so it stays a short sentence
-  // and does not replay reviewer internals.
-  assert.doesNotMatch(notice.text, /provider secret/)
-  assert.match(notice.text, /needs your confirmation/)
+  // `text` is empty so the notice never reaches the coding model's context.
+  assert.equal(notice.text, "")
   assert.ok(notice.metadata?.request, "the notice must carry the request identity")
 })
 
-test("a fallback notice's text agrees with the applied verdict, not assumed escalation", async () => {
-  // A model fallback can accompany a completed approval, so the replayed `text`
-  // must not claim confirmation is still needed.
+test("a degraded approval emits one notice whose content stays out of `text`", async () => {
   const harness = createHarness({ model: null })
   await harness.setup()
   const event = await harness.run()
@@ -657,9 +653,8 @@ test("a fallback notice's text agrees with the applied verdict, not assumed esca
   const notices = harness.timelineNotices()
   assert.equal(notices.length, 1)
   const notice = notices[0]!
-  assert.match(notice.text, /Auto-review approved the pending read request/)
-  assert.doesNotMatch(notice.text, /needs your confirmation/)
   assert.match(notice.description!, /catalog default model test\/reviewer/)
+  assert.equal(notice.text, "")
 })
 
 test("a subagent's notice is routed to the root session and names its origin", async () => {
@@ -676,6 +671,8 @@ test("a subagent's notice is routed to the root session and names its origin", a
   assert.match(notice.description!, /review subagent/)
   assert.match(notice.description!, /Inspect the fixture/)
   assert.match(notice.description!, /reviewer model call failed/)
+  // A subagent notice must be visible to the user only, never to the model.
+  assert.equal(notice.text, "")
 })
 
 test("a nested subagent notice still resolves to the top-level session", async () => {
@@ -689,6 +686,7 @@ test("a nested subagent notice still resolves to the top-level session", async (
   assert.equal(notices.length, 1)
   assert.equal(notices[0]!.sessionID, "ses_root")
   assert.match(notices[0]!.description!, /explore subagent/)
+  assert.equal(notices[0]!.text, "")
 })
 
 test("a root session notice needs no origin annotation", async () => {
@@ -733,7 +731,9 @@ test("every automatic approval leaves a reason-free timeline notice", async () =
   assert.equal(notices.length, 1)
   assert.equal(notices[0]!.description, "Auto-review approved read.")
   assert.equal(notices[0]!.resume, true)
-  assert.equal(notices[0]!.text, "Auto-review approved the pending read request.")
+  // The notice carries its content in `description` and leaves `text` empty, which
+  // is the field the host assembles into the model request.
+  assert.equal(notices[0]!.text, "")
 })
 
 test("the explicit status command commits its output to the timeline instead of the inbox", async () => {

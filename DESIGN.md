@@ -71,12 +71,14 @@ A synthetic message has two fields with different reach, and the plugin assigns 
 
 | Field | Reaches | Used for |
 | --- | --- | --- |
-| `description` | The timeline only | Human-readable notice text: the diagnostic reason for failures and fallbacks, and a reason-free statement for approvals |
-| `text` | The model's next request, every later turn | A short, controlled sentence stating the applied verdict |
+| `description` | The timeline only | All human-readable notice text: the diagnostic reason for failures and fallbacks, and a reason-free statement for approvals |
+| `text` | The model's next request, every later turn | Left empty, so the notice never enters the model's context |
 
-OpenCode 2.0.4 paints only `message.description` for a `type === "synthetic"` message, so notice text must live there to be visible at all. Confirmed against 2.0.4: `text` is assembled into the following model request as a user message and is replayed on every subsequent turn, whereas `description` is display-only. An empty `text` is not an escape hatch, because it still becomes an empty user message. The plugin therefore keeps reviewer internals — provider errors, budget limits, model-fallback details — in `description` and sends a short sentence in `text` that states the applied verdict (`approved`, `denied`, or `needs your confirmation`). An approval notice carries no reviewer rationale in either field, so it cannot be read as a considered risk judgement. That keeps reviewer diagnostics out of the coding model's context without replaying a statement that contradicts the permission decision.
+OpenCode 2.0.4+ paints only `message.description` for a `type === "synthetic"` message, so notice text must live there to be visible at all. `text` is assembled into the following model request as a user message and replayed on every subsequent turn (verified on 2.0.6), and the host drops a synthetic message from the request entirely when its `text` is empty (also verified on 2.0.6). Every automatic review notice therefore sends `text: ""` and carries its content in `description` only. The one exception is `/auto-review` control feedback (`showStatus`), which is a direct reply to a command the user typed and stays model-visible like any other command output.
 
-Verified against OpenCode 2.0.4: a committed synthetic message appears in the persisted session context, stays out of `/api/session/{id}/inbox`, and its `description` is not part of the model's assembled messages. `resume: false` is never used, because that queues the message in the bottom inbox instead.
+That is deliberate for two reasons. An approval notice must not tell the coding model that a permission was reviewed and approved, because a model that knows its actions are pre-approved adapts to it; and a subagent's notice must not surface in the parent model's context at all, only in the user's timeline. Keeping the whole notice out of model context satisfies both, and it removes the model-visible verdict sentence that previously had to be kept consistent with the applied permission effect.
+
+Verified against OpenCode 2.0.6: a committed synthetic message appears in the persisted session context and stays out of `/api/session/{id}/inbox`, and `resume: false` is never used because that queues the message in the bottom inbox instead.
 
 | Outlet | Presentation |
 | --- | --- |
