@@ -34,6 +34,7 @@ function createHarness(
   let evaluate: ((event: any) => Promise<void>) | undefined
   let command: ((input: any) => Promise<void>) | undefined
   let onPrompt: ((event: any) => void) | undefined
+  let onContext: ((event: any) => Promise<void> | void) | undefined
   let onCompaction: ((event: any) => Promise<void> | void) | undefined
   let generateCalls = 0
   let contextCalls = 0
@@ -122,6 +123,7 @@ function createHarness(
     session: {
       hook: async (_name: string, callback: typeof onPrompt) => {
         if (_name === "prompt") onPrompt = callback
+        if (_name === "context") onContext = callback
         if (_name === "compaction") onCompaction = callback
         return { dispose: async () => undefined }
       },
@@ -193,6 +195,12 @@ function createHarness(
       assert.ok(onCompaction)
       await onCompaction({ sessionID, model: {}, system: [], messages: [], options: {} })
     },
+    async dispatch(sessionID = "ses_test", dispatchMessages: any[] = []) {
+      assert.ok(onContext)
+      const event = { sessionID, model: {}, system: [], messages: dispatchMessages, options: {} }
+      await onContext(event)
+      return event
+    },
     async rpcStatus() {
       assert.ok(rpcHandlers?.status)
       return rpcHandlers.status(undefined, {})
@@ -207,6 +215,47 @@ function createHarness(
     sessions,
   }
 }
+
+test("a committed notice is stripped from the dispatched model request", async () => {
+  // The host replays a committed synthetic body into later requests as a user
+  // message whose only part is empty text. That shape must never reach the model,
+  // while the notice itself stays in the session transcript for the user.
+  const harness = createHarness()
+  await harness.setup()
+  await harness.run()
+  const notice = harness.timelineNotices()[0]!
+  assert.equal(notice.text, "")
+  assert.equal(notice.description, "Auto-review approved read.")
+  const replay = { role: "user", id: "notice-1", content: [{ type: "text", text: "" }] }
+  const real = { role: "user", id: "user-1", content: [{ type: "text", text: "Read package.json" }] }
+  const event = await harness.dispatch("ses_test", [real, replay])
+  assert.deepEqual(event.messages, [real], "only the empty notice body is removed")
+  // The notice stays user-visible: it is still a committed timeline message.
+  assert.equal(harness.timelineNotices().length, 1)
+})
+
+test("a notice committed by an earlier plugin instance is still stripped", async () => {
+  // Shape matching is required because a fresh plugin instance has no memory of
+  // notices committed before it loaded, yet those bodies remain in the session.
+  const harness = createHarness()
+  await harness.setup()
+  const stale = { role: "user", id: "stale-notice", content: [{ type: "text", text: "" }] }
+  const real = { role: "user", id: "user-1", content: [{ type: "text", text: "hello" }] }
+  const event = await harness.dispatch("ses_test", [stale, real])
+  assert.deepEqual(event.messages, [real])
+})
+
+test("meaningful model messages are never stripped", async () => {
+  const harness = createHarness()
+  await harness.setup()
+  const user = { role: "user", id: "u", content: [{ type: "text", text: "do work" }] }
+  const multi = { role: "user", id: "m", content: [{ type: "text", text: "" }, { type: "text", text: "keep" }] }
+  const media = { role: "user", id: "i", content: [{ type: "media", mediaType: "image/png", data: "x" }] }
+  const assistant = { role: "assistant", id: "a", content: [{ type: "text", text: "" }] }
+  const empty = { role: "user", id: "e", content: [] }
+  const event = await harness.dispatch("ses_test", [user, multi, media, assistant, empty])
+  assert.deepEqual(event.messages, [user, multi, media, assistant, empty])
+})
 
 test("only a valid eligible ask can be auto-allowed", async () => {
   const harness = createHarness()

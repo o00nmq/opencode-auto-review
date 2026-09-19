@@ -74,11 +74,15 @@ export default Plugin.define({
     // - `description` is the only field the TUI paints for a synthetic message
     //   (OpenCode 2.0.4+ renders `message.description` for `type === "synthetic"`),
     //   so it carries all human-readable text.
-    // - `text` is assembled into the model's next request as a user message, so it
-    //   is deliberately empty: the host drops an empty synthetic body from the
-    //   request entirely (verified on 2.0.6), which makes the notice visible to the
-    //   user without telling the coding model that a permission was reviewed or
-    //   approved. A non-empty `text` would be replayed on every later turn.
+    // - `text` is assembled into the model's next request as a user message. It is
+    //   deliberately empty, and the `context` hook below strips that empty body
+    //   from the dispatched request (see `isNoticeBody`). The host does *not* drop
+    //   an empty synthetic body on its own: OpenCode 2.0.6 materializes it as a
+    //   user message whose only part is empty text, and replays it on every later
+    //   turn. Leaving it in place both leaks a review marker into the coding
+    //   model's context and, per isolated 2.0.6 probes, can produce a degenerate
+    //   zero-token request. A non-empty `text` would be replayed just the same and
+    //   is therefore never used.
     //
     // Concurrent identical evaluations share one review (see `reviewRequest`), so
     // they must also share one notice. Keyed by request identity, and cleared when
@@ -190,8 +194,21 @@ export default Plugin.define({
     })
 
     // Capture committed originals before model dispatch, including compaction requests.
+    //
+    // The host replays a committed synthetic body into later model requests as a
+    // user message, so every notice is removed again before dispatch (see
+    // `isNoticeBody`). The notice stays in the session transcript and is visible
+    // to the user; it just never reaches the coding model. The archive reads the
+    // session context independently, where a notice is a `synthetic` message
+    // rather than a `user` one, so this does not affect authorization.
     const contextRegistration = await ctx.session.hook("context", async (event) => {
-      if (!disposed) await archive.load(event.sessionID, modelController.signal)
+      if (disposed) return
+      await archive.load(event.sessionID, modelController.signal)
+      const messages = event.messages
+      if (Array.isArray(messages)) {
+        const kept = messages.filter((message) => !isNoticeBody(message))
+        if (kept.length !== messages.length) event.messages = kept
+      }
     })
 
     // V2 dispatches checkpoint summaries through the separate compaction hook, so
@@ -444,6 +461,32 @@ export default Plugin.define({
 
 function denialMessage(reason: string): string {
   return `Auto-review denied: ${reason.trim()} Do not retry unchanged or bypass this decision with obfuscation, indirection, shell expansion, or hidden output.`
+}
+
+/**
+ * The model-facing form of a committed synthetic notice.
+ *
+ * A notice carries its text in `description` and leaves `text` empty, but the
+ * host still replays it into later model requests as a `user` message whose only
+ * parts are empty text (verified on OpenCode 2.0.6; the host does not drop an
+ * empty synthetic body on its own). The `context` hook removes exactly that
+ * shape before dispatch so a review notice never reaches the coding model, while
+ * the notice itself stays in the session transcript for the user.
+ *
+ * Matching on shape rather than a message id also strips notices committed by an
+ * earlier plugin instance, which a per-instance id set could not know about.
+ * No meaningful message is all-empty text, so this cannot drop real content.
+ */
+function isNoticeBody(message: { role?: unknown; content?: unknown }): boolean {
+  if (message.role !== "user") return false
+  const content = message.content
+  if (!Array.isArray(content) || content.length === 0) return false
+  return content.every((part) => {
+    if (typeof part !== "object" || part === null) return false
+    const candidate = part as { type?: unknown; text?: unknown }
+    if (candidate.type !== "text" && candidate.type !== "input_text") return false
+    return (candidate.text ?? "") === ""
+  })
 }
 
 /** Surface reviewer degradation instead of hiding it behind an otherwise normal decision. */
