@@ -78,7 +78,7 @@ OpenCode 2.0.4+ paints only `message.description` for a `type === "synthetic"` m
 
 That is deliberate for two reasons. An approval notice must not tell the coding model that a permission was reviewed and approved, because a model that knows its actions are pre-approved adapts to it; and a subagent's notice must not surface in the parent model's context at all, only in the user's timeline. Keeping the whole notice out of model context satisfies both, and it removes the model-visible verdict sentence that previously had to be kept consistent with the applied permission effect.
 
-Verified against OpenCode 2.0.6: a committed synthetic message appears in the persisted session context and stays out of `/api/session/{id}/inbox`, and `resume: false` is never used because that queues the message in the bottom inbox instead. Also verified on 2.0.6 with an `http.request` probe: after the `context`-hook filter, every dispatched request carries neither an empty notice body nor the notice's text, while the notice remains committed and user-visible.
+Verified against OpenCode 2.0.6: a committed synthetic message appears in the persisted session context and stays out of `/api/session/{id}/inbox`, and `resume: false` is never used because that queues the message in the bottom inbox instead. Also verified on 2.0.6 with an `http.request` probe of the agent loop: after the `context`-hook filter, every dispatched agent-loop request carried neither an empty notice body nor the notice's text, while the notice remained committed and user-visible. V2 dispatches checkpoint summaries through the separate `compaction` hook, so the same filter is registered there; that path is covered by a unit test rather than by the HTTP probe.
 
 | Outlet | Presentation |
 | --- | --- |

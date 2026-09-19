@@ -201,20 +201,30 @@ export default Plugin.define({
     // to the user; it just never reaches the coding model. The archive reads the
     // session context independently, where a notice is a `synthetic` message
     // rather than a `user` one, so this does not affect authorization.
+    //
+    // Both history-consuming dispatch hooks filter: V2 dispatches the agent loop
+    // through `context` and checkpoint summaries through the separate `compaction`
+    // hook, so filtering only `context` would still leak a notice into the
+    // compaction request.
+    const dropNoticeBodies = (event: { messages?: unknown }): void => {
+      const messages = event.messages
+      if (!Array.isArray(messages)) return
+      const kept = messages.filter((message) => !isNoticeBody(message))
+      if (kept.length !== messages.length) event.messages = kept
+    }
+
     const contextRegistration = await ctx.session.hook("context", async (event) => {
       if (disposed) return
       await archive.load(event.sessionID, modelController.signal)
-      const messages = event.messages
-      if (Array.isArray(messages)) {
-        const kept = messages.filter((message) => !isNoticeBody(message))
-        if (kept.length !== messages.length) event.messages = kept
-      }
+      dropNoticeBodies(event)
     })
 
     // V2 dispatches checkpoint summaries through the separate compaction hook, so
     // capture the same originals there to keep authorization completeness intact.
     const compactionRegistration = await ctx.session.hook("compaction", async (event) => {
-      if (!disposed) await archive.load(event.sessionID, modelController.signal)
+      if (disposed) return
+      await archive.load(event.sessionID, modelController.signal)
+      dropNoticeBodies(event)
     })
 
     const registration = await ctx.permission.hook("evaluate", async (event) => {
@@ -485,7 +495,7 @@ function isNoticeBody(message: { role?: unknown; content?: unknown }): boolean {
     if (typeof part !== "object" || part === null) return false
     const candidate = part as { type?: unknown; text?: unknown }
     if (candidate.type !== "text" && candidate.type !== "input_text") return false
-    return (candidate.text ?? "") === ""
+    return candidate.text === ""
   })
 }
 

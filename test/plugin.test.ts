@@ -191,9 +191,11 @@ function createHarness(
     generationSignal: () => generationSignal,
     generatedPrompts: () => generatedPrompts,
     admitPrompt: (sessionID: string) => onPrompt!({ sessionID }),
-    async compact(sessionID = "ses_test") {
+    async compact(sessionID = "ses_test", compactionMessages: any[] = []) {
       assert.ok(onCompaction)
-      await onCompaction({ sessionID, model: {}, system: [], messages: [], options: {} })
+      const event = { sessionID, model: {}, system: [], messages: compactionMessages, options: {} }
+      await onCompaction(event)
+      return event
     },
     async dispatch(sessionID = "ses_test", dispatchMessages: any[] = []) {
       assert.ok(onContext)
@@ -253,8 +255,24 @@ test("meaningful model messages are never stripped", async () => {
   const media = { role: "user", id: "i", content: [{ type: "media", mediaType: "image/png", data: "x" }] }
   const assistant = { role: "assistant", id: "a", content: [{ type: "text", text: "" }] }
   const empty = { role: "user", id: "e", content: [] }
-  const event = await harness.dispatch("ses_test", [user, multi, media, assistant, empty])
-  assert.deepEqual(event.messages, [user, multi, media, assistant, empty])
+  // A malformed or absent `text` is not the measured notice shape, so the
+  // destructive predicate must not broaden to cover it.
+  const nullText = { role: "user", id: "n", content: [{ type: "text", text: null }] }
+  const missingText = { role: "user", id: "x", content: [{ type: "text" }] }
+  const event = await harness.dispatch("ses_test", [user, multi, media, assistant, empty, nullText, missingText])
+  assert.deepEqual(event.messages, [user, multi, media, assistant, empty, nullText, missingText])
+})
+
+test("a notice body is stripped from the compaction request too", async () => {
+  // V2 dispatches checkpoint summaries through the separate compaction hook, so a
+  // notice body must be filtered there as well; filtering only `context` would
+  // still leak it into the compaction request.
+  const harness = createHarness()
+  await harness.setup()
+  const replay = { role: "user", id: "notice-1", content: [{ type: "text", text: "" }] }
+  const real = { role: "user", id: "user-1", content: [{ type: "text", text: "Read package.json" }] }
+  const event = await harness.compact("ses_test", [real, replay])
+  assert.deepEqual(event.messages, [real])
 })
 
 test("only a valid eligible ask can be auto-allowed", async () => {
