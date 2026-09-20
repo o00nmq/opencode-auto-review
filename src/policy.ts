@@ -15,6 +15,8 @@ export interface PluginOptions {
   maxReviewTokens: number
   actions: string[]
   humanReviewRules: HumanReviewRule[]
+  /** When false, a decision that needs a human becomes a deny instead of an ask. */
+  humanFallback: boolean
   debug: boolean
 }
 
@@ -26,6 +28,10 @@ export const DEFAULT_OPTIONS: PluginOptions = {
   maxReviewTokens: 2_048,
   actions: ["read", "edit", "glob", "grep", "shell", "webfetch", "websearch", "external_directory"],
   humanReviewRules: [],
+  // Off by default: unattended work must not stall on a prompt nobody answers.
+  // A decision the reviewer cannot approve becomes a deny the coding model can
+  // react to, and an explicit `humanReviewRules` entry is how a user opts back in.
+  humanFallback: false,
   debug: false,
 }
 
@@ -33,7 +39,7 @@ export function parseOptions(input: unknown): PluginOptions {
   if (!isRecord(input)) return parseOptions({})
   assertAllowedKeys(input, new Set([
     "enabled", "agent", "model", "timeoutMs", "maxReviewTokens",
-    "actions", "humanReviewRules", "debug", "modelOptions",
+    "actions", "humanReviewRules", "humanFallback", "debug", "modelOptions",
   ]), "plugin options")
 
   if (input.enabled !== undefined && typeof input.enabled !== "boolean") throw new TypeError("enabled must be a boolean")
@@ -47,6 +53,9 @@ export function parseOptions(input: unknown): PluginOptions {
   const maxReviewTokens = integerOption(input.maxReviewTokens, DEFAULT_OPTIONS.maxReviewTokens, 256, 16_384, "maxReviewTokens")
   const actions = input.actions === undefined ? [...DEFAULT_OPTIONS.actions] : stringArray(input.actions, "actions")
   const humanReviewRules = parseHumanReviewRules(input.humanReviewRules)
+  if (input.humanFallback !== undefined && typeof input.humanFallback !== "boolean") {
+    throw new TypeError("humanFallback must be a boolean")
+  }
   if (input.debug !== undefined && typeof input.debug !== "boolean") throw new TypeError("debug must be a boolean")
 
   return {
@@ -58,6 +67,7 @@ export function parseOptions(input: unknown): PluginOptions {
     maxReviewTokens,
     actions,
     humanReviewRules,
+    humanFallback: input.humanFallback === true,
     debug: input.debug === true,
   }
 }

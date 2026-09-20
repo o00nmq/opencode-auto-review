@@ -18,19 +18,26 @@ export function prepareReviewJournal(
   reasoningTokens = DEFAULT_OPTIONS.maxReviewTokens,
 ): PreparedReviewJournal | undefined {
   const previous = readState(stored)
+  // The journal tracks the *completed* history, not the pending tool. Several
+  // reviews can share one history while differing only in the tool under review
+  // (parallel calls in one assistant message, or a repeated evaluation), and
+  // measuring against the pending tool would rebuild the epoch each time. A new
+  // epoch restarts the prompt with a fresh `review_epoch` line, which breaks the
+  // byte prefix at the static policy and forces the provider to recompute the
+  // whole journal instead of reusing its prefix cache.
   const historical = request.context.slice(0, -1)
   const current = request.context.at(-1)
   if (!current || current.type !== "tool") return
 
   if (previous && previous.checkpoint === request.checkpoint && previous.sourceLength <= historical.length &&
-    digest(request.context.slice(0, previous.sourceLength)) === previous.sourceDigest) {
+    digest(historical.slice(0, previous.sourceLength)) === previous.sourceDigest) {
     const appended = [
       ...previous.lines,
       ...historical.slice(previous.sourceLength).map(serialize),
       serialize(reviewLine(current, request)),
     ]
     if (promptTokens(appended, reasoningTokens) <= maxInputTokens) {
-      return prepared(previous.epoch, request.context, appended, reasoningTokens, request.checkpoint)
+      return prepared(previous.epoch, historical, appended, reasoningTokens, request.checkpoint)
     }
   }
 
@@ -72,7 +79,7 @@ function startEpoch(
   addWithinBudget([...tools].reverse(), undefined)
 
   const lines = epochLines(epoch, request, historical, selected, currentTool)
-  return prepared(epoch, request.context, lines, reasoningTokens, request.checkpoint)
+  return prepared(epoch, historical, lines, reasoningTokens, request.checkpoint)
 
   function addWithinBudget(indexes: readonly number[], category: keyof typeof remaining | undefined) {
     for (const index of indexes) {
@@ -127,24 +134,24 @@ function reviewLine(current: Extract<ReviewContextEntry, { type: "tool" }>, requ
 
 function prepared(
   epoch: number,
-  context: readonly ReviewContextEntry[],
+  historical: readonly ReviewContextEntry[],
   lines: string[],
   reasoningTokens: number,
   checkpoint?: string,
 ): PreparedReviewJournal {
   const state = {
     ...(checkpoint ? { checkpoint } : {}),
-    version: 2 as const,
+    version: 3 as const,
     epoch,
-    sourceLength: context.length,
-    sourceDigest: digest(context),
+    sourceLength: historical.length,
+    sourceDigest: digest(historical),
     lines,
   }
   return { ...state, prompt: buildReviewPrompt(lines, reasoningTokens) }
 }
 
 function readState(value: unknown): ReviewerJournalState | undefined {
-  if (!isRecord(value) || value.version !== 2 || !Number.isSafeInteger(value.epoch) || (value.epoch as number) < 0 ||
+  if (!isRecord(value) || value.version !== 3 || !Number.isSafeInteger(value.epoch) || (value.epoch as number) < 0 ||
     !Number.isSafeInteger(value.sourceLength) || (value.sourceLength as number) < 0 ||
     typeof value.sourceDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.sourceDigest) ||
     !Array.isArray(value.lines) || value.lines.some((line) => typeof line !== "string")) return

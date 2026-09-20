@@ -9,6 +9,6 @@ test("package exposes server, TUI, and RPC entrypoints", () => {
   assert.equal(typeof plugin.setup, "function")
   assert.equal(tui.id, "opencode-auto-review.tui")
   assert.equal(AutoReview.id, "opencode-auto-review")
-  assert.deepEqual(Object.keys(AutoReview.methods).sort(), ["setEnabled", "status"])
-  assert.deepEqual(Object.keys(AutoReview.events).sort(), ["state"])
+  assert.deepEqual(Object.keys(AutoReview.methods).sort(), ["setEnabled", "setFallback", "status"])
+  assert.deepEqual(Object.keys(AutoReview.events).sort(), ["notice", "state"])
 })

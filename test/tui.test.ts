@@ -14,25 +14,32 @@ import tui from "../src/tui.js"
 /** A stateful fake RPC server so the TUI state is real, not just handler capture. */
 function harness(options: { enabled?: boolean; failSwitch?: boolean } = {}) {
   let enabled = options.enabled ?? true
+  let humanFallback = true
   let failStatus = false
   const statusCalls: Array<{ input: unknown; options: any }> = []
   const toasts: any[] = []
   const connectedHandlers: Array<() => void> = []
-  let selectReply: string | undefined
+  const eventHandlers = new Map<string, (event: any) => void>()
+  let selectReplies: string[] = []
   const commands: any[] = []
   let slotClaim: any
   const client: any = {
     status: async (input: unknown, callOptions: any) => {
       statusCalls.push({ input, options: callOptions })
       if (failStatus) throw new Error("offline")
-      return { enabled }
+      return { enabled, humanFallback }
     },
     setEnabled: async (input: any) => {
       if (options.failSwitch) throw new Error("offline")
       enabled = input.enabled
-      return { enabled }
+      return { enabled, humanFallback }
     },
-    events: { on: (_name: string, _handler: unknown) => () => undefined },
+    setFallback: async (input: any) => {
+      if (options.failSwitch) throw new Error("offline")
+      humanFallback = input.humanFallback
+      return { enabled, humanFallback }
+    },
+    events: { on: (name: string, handler: (event: any) => void) => { eventHandlers.set(name, handler); return () => undefined } },
   }
   const context: any = {
     options: {},
@@ -43,16 +50,18 @@ function harness(options: { enabled?: boolean; failSwitch?: boolean } = {}) {
       toast: { show: (toast: any) => toasts.push(toast) },
       slot: (claim: any) => { slotClaim = claim; return () => undefined },
       router: { current: () => ({ type: "session", sessionID: "ses" }) },
-      dialog: { select: async () => selectReply },
+      dialog: { select: async () => selectReplies.shift() },
     },
     keymap: { layer: (callback: () => any) => { commands.push(...callback().commands); return () => undefined } },
     theme: { text: { action: { primary: { default: "#fff" } } } },
   }
   return {
     context, toasts, statusCalls, commands,
-    setReply: (value: string | undefined) => { selectReply = value },
+    setReply: (value: string | undefined) => { if (value !== undefined) selectReplies.push(value) },
     setFailStatus: (value: boolean) => { failStatus = value },
     serverState: () => enabled,
+    serverFallback: () => humanFallback,
+    emitNotice: (data: unknown, location?: unknown) => eventHandlers.get("notice")?.({ data, location }),
     connect: () => connectedHandlers.forEach((handler) => handler()),
     // The host renders a slot claim inside a component, which is where the
     // keymap layer must be registered. Invoking render exercises that path.
@@ -77,7 +86,7 @@ test("the footer command shows the RPC-confirmed state and reflects a real switc
 
   h.setReply("status")
   await run()
-  assert.equal(h.toasts.at(-1)!.message, "Auto-review is enabled.")
+  assert.equal(h.toasts.at(-1)!.message, "Auto-review is enabled (human fallback on).")
 
   const toastsBefore = h.toasts.length
   h.setReply("off")
@@ -87,7 +96,54 @@ test("the footer command shows the RPC-confirmed state and reflects a real switc
 
   h.setReply("status")
   await run()
-  assert.equal(h.toasts.at(-1)!.message, "Auto-review is disabled.")
+  assert.equal(h.toasts.at(-1)!.message, "Auto-review is disabled (human fallback on).")
+  await cleanup?.()
+})
+
+test("a reviewer notice is rendered as a toast with its severity", async () => {
+  const h = harness()
+  const cleanup = await tui.setup(h.context)
+  h.renderSlot()
+  await tick()
+  h.emitNotice({ description: "Auto-review approved read.", severity: "success" })
+  assert.equal(h.toasts.at(-1)!.message, "Auto-review approved read.")
+  assert.equal(h.toasts.at(-1)!.variant, "success")
+  h.emitNotice({ description: "Auto-review notice (shell): needs confirmation", severity: "warning" })
+  assert.equal(h.toasts.at(-1)!.variant, "warning")
+  // Malformed payloads are ignored instead of rendering an empty toast.
+  const before = h.toasts.length
+  h.emitNotice({ severity: "warning" })
+  h.emitNotice(undefined)
+  assert.equal(h.toasts.length, before)
+  await cleanup?.()
+})
+
+test("a notice from another location is ignored", async () => {
+  // RPC events reach every connected client, so a notice from another project must
+  // not appear while the user is viewing this one.
+  const h = harness()
+  const cleanup = await tui.setup(h.context)
+  h.renderSlot()
+  await tick()
+  h.emitNotice({ description: "elsewhere", severity: "success" }, { directory: "/other", workspaceID: "ws" })
+  assert.equal(h.toasts.length, 0)
+  h.emitNotice({ description: "here", severity: "success" }, { directory: "/repo", workspaceID: "ws" })
+  assert.equal(h.toasts.at(-1)!.message, "here")
+  await cleanup?.()
+})
+
+test("the human fallback can be switched from the palette", async () => {
+  const h = harness()
+  const cleanup = await tui.setup(h.context)
+  h.renderSlot()
+  const run = h.commands.find((command) => command.id === "auto-review.toggle")!.run
+  await tick()
+  // First select chooses the fallback flow, second turns it off.
+  h.setReply("fallback")
+  h.setReply("off")
+  await run()
+  assert.equal(h.serverFallback(), false, "the fallback switch must reach the server")
+  assert.match(h.toasts.at(-1)!.message, /Human fallback is off/)
   await cleanup?.()
 })
 
@@ -106,7 +162,7 @@ test("a switch that cannot be confirmed toasts and keeps the previous state", as
 
   h.setReply("status")
   await run()
-  assert.equal(h.toasts.at(-1)!.message, "Auto-review is enabled.", "status must not report the failed guess")
+  assert.equal(h.toasts.at(-1)!.message, "Auto-review is enabled (human fallback on).", "status must not report the failed guess")
   await cleanup?.()
 })
 

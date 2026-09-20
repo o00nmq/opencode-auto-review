@@ -8,11 +8,31 @@ export default Plugin.define({
   id: "opencode-auto-review.tui",
   setup(ctx) {
     const [enabled, setEnabled] = createSignal(ctx.options.enabled !== false)
+    // Must match `parseOptions()`: the server default is off.
+    const [fallback, setFallback] = createSignal(ctx.options.humanFallback === true)
     const rpc = ctx.client.rpc(AutoReview)
     let disposed = false
     const toast = (message: string) => {
       if (!disposed) ctx.ui.toast.show({ message, variant: "warning", duration: 4_000 })
     }
+
+    // Reviewer notices arrive over RPC and are shown as a toast. They are never
+    // committed to the session, so a notice cannot resume an idle session or enter
+    // the coding model's context. Events from another location are ignored, the
+    // same way the state controller ignores them.
+    const activeLocation = ctx.location
+    const isLocal = (location: { directory?: string; workspaceID?: string } | undefined): boolean => {
+      if (!activeLocation || !location) return true
+      return location.directory === activeLocation.directory && location.workspaceID === activeLocation.workspaceID
+    }
+    const stopNotices = rpc.events.on("notice", (event) => {
+      if (disposed || !isLocal(event.location)) return
+      const data = event.data as { description?: unknown; severity?: unknown } | undefined
+      if (typeof data?.description !== "string" || !data.description) return
+      const severity = data.severity
+      const variant = severity === "success" || severity === "info" || severity === "warning" || severity === "error" ? severity : "info"
+      ctx.ui.toast.show({ message: data.description, variant, duration: variant === "success" ? 3_000 : 6_000 })
+    })
 
     // Only confirmed RPC responses or events move the signal; the controller
     // keeps the authoritative state and discards stale status responses.
@@ -20,7 +40,9 @@ export default Plugin.define({
       client: rpc,
       location: ctx.location,
       initial: ctx.options.enabled !== false,
+      initialFallback: ctx.options.humanFallback === true,
       onChange: (value) => setEnabled(value),
+      onFallbackChange: (value) => setFallback(value),
       toast,
     })
     controller.start()
@@ -53,6 +75,7 @@ export default Plugin.define({
               options: [
                 { title: "Enable", value: "on", description: "Review eligible requests; ask when evidence or confirmation is needed" },
                 { title: "Disable", value: "off", description: "Use normal OpenCode permission handling" },
+                { title: "Human fallback", value: "fallback", description: "When off, a decision needing a human is denied instead of prompting, so unattended work cannot stall" },
                 { title: "Show status", value: "status" },
               ],
             })
@@ -64,7 +87,28 @@ export default Plugin.define({
                 toast("Auto-review status is unavailable right now.")
                 return
               }
-              ctx.ui.toast.show({ message: `Auto-review is ${controller.enabled() ? "enabled" : "disabled"}.` })
+              ctx.ui.toast.show({
+                message: `Auto-review is ${controller.enabled() ? "enabled" : "disabled"} (human fallback ${controller.humanFallback() ? "on" : "off"}).`,
+              })
+              return
+            }
+            if (action === "fallback") {
+              // Refresh first so the suggested value matches the server state.
+              await controller.refresh()
+              if (disposed) return
+              const choice = await ctx.ui.dialog.select({
+                title: "Human fallback",
+                current: controller.humanFallback() ? "on" : "off",
+                options: [
+                  { title: "On", value: "on", description: "Escalate to a human prompt when a decision needs confirmation" },
+                  { title: "Off", value: "off", description: "Deny instead of prompting, so unattended work cannot stall" },
+                ],
+              })
+              if (!choice || disposed) return
+              const confirmed = await controller.setFallback(choice === "on")
+              if (confirmed) {
+                ctx.ui.toast.show({ message: `Human fallback is ${controller.humanFallback() ? "on" : "off"}.` })
+              }
               return
             }
             await controller.setEnabled(action === "on")
@@ -90,6 +134,7 @@ export default Plugin.define({
     return () => {
       disposed = true
       stopConnected()
+      stopNotices()
       controller.dispose()
       removeStatus()
     }

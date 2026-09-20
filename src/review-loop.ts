@@ -14,7 +14,13 @@ export interface ReviewOutcome {
 
 interface StageResult { text?: string; timedOut: boolean; error?: string }
 
-const REVIEW_FAILURE_NOTE = "This is not a safety judgment about the requested action. Human confirmation is required."
+/**
+ * Reason text shared by every "the reviewer could not approve" path. It must not
+ * promise a human: with the human fallback disabled the same reason becomes a
+ * denial, and a message that says confirmation is coming would both mislead the
+ * coding model and tell it a permission boundary was relaxed.
+ */
+const REVIEW_FAILURE_NOTE = "This is not a safety judgment about the requested action."
 
 /** Evidence-driven review: finish immediately when supported, investigate only as needed. */
 export async function runReviewLoop(input: {
@@ -79,10 +85,10 @@ export async function runReviewLoop(input: {
     const decision = parseReviewResponse(result.text)
     if (decision) {
       if (decision.decision === "allow" && !input.evidence.authorizationComplete) {
-        return unavailable("incomplete_authorization", "Original authorization before compaction is unavailable; human confirmation is required")
+        return unavailable("incomplete_authorization", "Original authorization before compaction is unavailable, so the review could not confirm authorization")
       }
       if (decision.decision === "allow" && input.evidence.authorization.some((entry) => !disclosedUsers.has(entry.text))) {
-        return unavailable("incomplete_authorization", "Original user instructions were omitted from the reviewed context; human confirmation is required")
+        return unavailable("incomplete_authorization", "Original user instructions were omitted from the reviewed context, so the review could not confirm authorization")
       }
       input.onRound?.(round, decision.decision)
       return finish({ code: decision.decision, decision })

@@ -1,6 +1,6 @@
 # OpenCode Auto Review
 
-Automatically reviews **OpenCode V2** permission prompts for long-running unattended work. Authorized operations with low or medium bounded risk proceed automatically; unsafe operations are denied; decision-critical uncertainty or explicit confirmation requirements go to you.
+Automatically reviews **OpenCode V2** permission prompts for long-running unattended work. Authorized operations with low or medium bounded risk proceed automatically; everything else is denied with a reason the coding model can act on.
 
 Requires OpenCode 2.0.4 or newer, which is the release that exposes the `ctx.model` plugin context this plugin uses. An older host cannot provide that context shape.
 
@@ -28,15 +28,17 @@ Choose a reviewer model in `opencode.json(c)`. Replace the example with an avail
 }
 ```
 
-The model is optional: the plugin falls back to the `auto-reviewer` agent's model, then OpenCode's default. Reviewer fallbacks, model-registration failures, exhausted provider errors, and timeouts are shown as messages in the conversation timeline, with the reason visible in the notice. Notices for a subagent's request are routed to the session you are watching rather than left in the child session. They are never queued in the bottom pending inbox, and they do not change the permission decision.
+The model is optional: the plugin falls back to the `auto-reviewer` agent's model, then OpenCode's default. Notices are CLI toasts, so nothing is ever written to the session and an idle session is never resumed. Notices never change the permission decision.
 
 Automatic review is enabled by default, with **2,048 output tokens** and **90 seconds total per request**. Change these with `maxReviewTokens` and `timeoutMs`. The default output parameter targets Chat Completions; see [advanced configuration](DESIGN.md#configuration) for other APIs and human-only rules.
 
 ## Usage
 
-Use `/auto-review on`, `/auto-review off`, `/auto-review toggle`, or `/auto-review status`. The command palette also provides **Toggle Auto-review**. The TUI reads and changes this state over the plugin RPC contract instead of parsing session text; the slash command keeps its explicit status output.
+`/auto-review [on|off|toggle|status]`, or the palette's **Toggle Auto-review**. The TUI reads and changes this state over the plugin RPC contract instead of parsing session text; the slash command keeps its explicit status output.
 
 The plugin handles eligible requests that would otherwise ask for permission. It can consult earlier user instructions and tool results when needed, including after the main conversation is compacted. Its feedback is limited to permission and safety decisions.
+
+By default the plugin never waits for a human: a request the reviewer cannot approve becomes a **denial** whose reason tells the model what was missing, so unattended runs cannot stall. Use `/auto-review fallback on` to prompt instead. An explicit `humanReviewRules` entry always prompts.
 
 ## Development
 

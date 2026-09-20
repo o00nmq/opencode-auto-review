@@ -17,13 +17,17 @@ import { AutoReview } from "./rpc.js"
 import type { PermissionEvent, ReviewerJournalState, ReviewRequest } from "./types.js"
 
 const FAILURE_MESSAGE = "The request could not be verified for automatic approval."
-const REVIEWER_FAILURE_MESSAGE = "Automatic review did not return a complete valid decision. This is not a safety judgment about the requested action. Human confirmation is required."
+const REVIEWER_FAILURE_MESSAGE = "Automatic review did not return a complete valid decision. This is not a safety judgment about the requested action."
+
+/** How the CLI presents a reviewer notice. */
+type NoticeSeverity = "success" | "info" | "warning" | "error"
 
 export default Plugin.define({
   id: "opencode-auto-review",
   async setup(ctx) {
     const options = parseOptions(ctx.options)
     let enabled = options.enabled
+    let humanFallback = options.humanFallback
     let model: ReviewerModel | undefined
     let modelNotices: string[] = []
     let pendingModel: Promise<{ model: ReviewerModel | undefined; notices: string[] }> | undefined
@@ -43,69 +47,84 @@ export default Plugin.define({
     // The authoritative toggle state is shared with the TUI over RPC. Emitting
     // the state event keeps every client in sync regardless of which code path
     // (slash command or RPC call) performed the change.
-    let emitState: (value: boolean) => void = () => undefined
+    let emitState: () => void = () => undefined
     const setEnabled = (next: boolean): boolean => {
       if (disposed) return enabled
       if (enabled === next) return enabled
       enabled = next
       if (!enabled) for (const controller of activeControllers.keys()) controller.abort()
-      emitState(enabled)
+      emitState()
       return enabled
+    }
+    // With fallback off, a decision that needs a human is a deny instead of a
+    // prompt, so an unattended session cannot stall on a question nobody answers.
+    const setHumanFallback = (next: boolean): boolean => {
+      if (disposed) return humanFallback
+      if (humanFallback === next) return humanFallback
+      humanFallback = next
+      emitState()
+      return humanFallback
     }
 
     const rpcRegistration = await ctx.rpc.register(AutoReview, {
-      status: async () => ({ enabled }),
+      status: async () => ({ enabled, humanFallback }),
       setEnabled: async (input) => {
         const requested = (input as { enabled?: unknown } | undefined)?.enabled
         if (typeof requested === "boolean") setEnabled(requested)
-        return { enabled }
+        return { enabled, humanFallback }
+      },
+      setFallback: async (input) => {
+        const requested = (input as { humanFallback?: unknown } | undefined)?.humanFallback
+        if (typeof requested === "boolean") setHumanFallback(requested)
+        return { enabled, humanFallback }
       },
     })
-    emitState = (value) => {
-      void rpcRegistration.events.emit("state", { enabled: value }).catch(() => undefined)
+    emitState = () => {
+      void rpcRegistration.events.emit("state", { enabled, humanFallback }).catch(() => undefined)
+    }
+    let emitNotice: (description: string, severity: NoticeSeverity) => void = () => undefined
+    emitNotice = (description, severity) => {
+      void rpcRegistration.events.emit("notice", { description, severity }).catch(() => undefined)
     }
 
-    // Reviewer notifications are committed session timeline messages, not
-    // transient toasts or bottom pending-inbox items: they scroll with the
-    // conversation and stay reviewable. `resume: true` (the default) commits the
-    // message; `resume: false` would queue it in the inbox instead.
+    // Reviewer notices are delivered to the CLI as a toast over the plugin RPC
+    // contract and are never written to the session.
     //
-    // Two field policies matter here, and they differ:
-    // - `description` is the only field the TUI paints for a synthetic message
-    //   (OpenCode 2.0.4+ renders `message.description` for `type === "synthetic"`),
-    //   so it carries all human-readable text.
-    // - `text` is assembled into the model's next request as a user message. It is
-    //   deliberately empty, and the `context` hook below strips that empty body
-    //   from the dispatched request (see `isNoticeBody`). The host does *not* drop
-    //   an empty synthetic body on its own: OpenCode 2.0.6 materializes it as a
-    //   user message whose only part is empty text, and replays it on every later
-    //   turn. Leaving it in place both leaks a review marker into the coding
-    //   model's context and, per isolated 2.0.6 probes, can produce a degenerate
-    //   zero-token request. A non-empty `text` would be replayed just the same and
-    //   is therefore never used.
+    // Every session-writing option either wakes the coding model or leaks into
+    // it. `session.synthetic` with `resume: true` (the default) resumes an idle
+    // session and adds a model turn; `resume: false` parks the body in the bottom
+    // inbox, where the next prompt promotes it into the transcript. The host also
+    // replays a committed notice body into later model requests as a user
+    // message. OpenCode V1 had an ignored, no-reply session message for exactly
+    // this use; V2 removed it (opencode#48644), so a CLI toast is the only
+    // supported surface that is visible without touching the session.
+    //
+    // The accepted cost is that a notice is transient and needs a connected CLI:
+    // a headless `opencode run` has no notification surface at all. The
+    // permission event itself remains the authoritative record, and its message
+    // still carries the reason inline in whatever client asked.
     //
     // Concurrent identical evaluations share one review (see `reviewRequest`), so
     // they must also share one notice. Keyed by request identity, and cleared when
     // a fresh review starts so a later legitimate review still notifies.
     const notified = new Set<string>()
 
-    const postNotice = (request: string, description: string, sessionID: string): void => {
+    const postNotice = (
+      request: string,
+      description: string,
+      sessionID: string,
+      severity: NoticeSeverity,
+    ): void => {
       if (disposed) return
       if (notified.has(request)) return
       notified.add(request)
       // Bound the marker set; request identities are unique per evaluation and a
       // stale marker only matters until that request is reviewed again.
       if (notified.size > 512) notified.delete(notified.values().next().value!)
-      void resolveNoticeSession(sessionID, request)
-        .then((target) => {
+      void describeOrigin(sessionID, request)
+        .then((origin) => {
           if (disposed) return
-          return ctx.session.synthetic({
-            sessionID: target.sessionID,
-            text: "",
-            description: target.origin ? `${description} (from ${target.origin})` : description,
-            metadata: { request },
-            resume: true,
-          })
+          emitNotice(origin ? `${description} (from ${origin})` : description, severity)
         })
         .catch((error) => diagnose({ action: "notice", request, outcome: "notice_failed", reason: describeError(error) }))
     }
@@ -116,7 +135,7 @@ export default Plugin.define({
     // permission message keeps whatever rationale the reviewer supplied.
     const notifyApproval = (sessionID: string, action: string, request: string): void => {
       diagnose({ action, request, outcome: "notice_approved" })
-      postNotice(request, `Auto-review approved ${action}.`, sessionID)
+      postNotice(request, `Auto-review approved ${action}.`, sessionID, "success")
     }
 
     const notifyReview = (
@@ -127,38 +146,43 @@ export default Plugin.define({
     ): void => {
       const detail = `Auto-review notice (${action}): ${reason.trim()}`
       diagnose({ action, request, outcome: "notice", reason: detail })
-      postNotice(request, detail, sessionID)
+      postNotice(request, detail, sessionID, "warning")
     }
 
-    // A subagent runs in its own child session, so a notice posted there never
-    // reaches the conversation the user is watching. Walk the `parentID` chain
-    // (bounded) toward the root session and post there instead, naming the
-    // originating session so the notice stays attributable. Successful lookups are
-    // cached because the chain is stable for a child session's lifetime; failures
-    // are not cached, so a transient lookup error cannot bury every later notice.
-    // Any failure falls back to the reviewed session rather than dropping it.
-    const noticeTargets = new Map<string, { sessionID: string; origin?: string }>()
-    async function resolveNoticeSession(sessionID: string, request: string): Promise<{ sessionID: string; origin?: string }> {
-      const cached = noticeTargets.get(sessionID)
-      if (cached) return cached
+    // A subagent runs in its own child session, so the notice names the
+    // originating subagent to stay attributable. Successful lookups are cached
+    // because a child session's identity is stable; failures are not cached, so a
+    // transient lookup error cannot bury every later notice. The lookup is bounded
+    // because a notice is best-effort: a session query that never settles must not
+    // delay the notice forever.
+    const NOTICE_ORIGIN_TIMEOUT_MS = 1_000
+    const noticeOrigins = new Map<string, string | undefined>()
+    async function describeOrigin(sessionID: string, request: string): Promise<string | undefined> {
+      if (noticeOrigins.has(sessionID)) return noticeOrigins.get(sessionID)
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let timedOut = false
       try {
-        // Name the session whose request actually needed review, not the root.
-        const reviewed = await ctx.session.get({ sessionID })
-        let current = sessionID
-        let parentID = reviewed?.parentID
-        for (let depth = 0; depth < 8 && typeof parentID === "string" && parentID; depth++) {
-          current = parentID
-          parentID = (await ctx.session.get({ sessionID: current }))?.parentID
+        const reviewed = await Promise.race([
+          ctx.session.get({ sessionID }),
+          new Promise<undefined>((resolve) => {
+            timer = setTimeout(() => { timedOut = true; resolve(undefined) }, NOTICE_ORIGIN_TIMEOUT_MS)
+          }),
+        ])
+        if (timedOut) {
+          diagnose({ action: "notice_route", request, outcome: "timeout" })
+          return undefined
         }
-        const target = current === sessionID ? { sessionID } : { sessionID: current, origin: sessionOrigin(reviewed) }
+        const origin = reviewed?.parentID ? sessionOrigin(reviewed) : undefined
         if (!disposed) {
-          noticeTargets.set(sessionID, target)
-          if (noticeTargets.size > 256) noticeTargets.delete(noticeTargets.keys().next().value!)
+          noticeOrigins.set(sessionID, origin)
+          if (noticeOrigins.size > 256) noticeOrigins.delete(noticeOrigins.keys().next().value!)
         }
-        return target
+        return origin
       } catch (error) {
         diagnose({ action: "notice_route", request, outcome: "failed", reason: describeError(error) })
-        return { sessionID }
+        return undefined
+      } finally {
+        if (timer) clearTimeout(timer)
       }
     }
 
@@ -171,17 +195,30 @@ export default Plugin.define({
     const commandRegistration = await ctx.command.transform((draft) => {
       draft.add({
         name: "auto-review",
-        description: "Usage: /auto-review [on|off|toggle|status] (no argument toggles)",
-        execute: async ({ sessionID, prompt, delivery }) => {
-          const action = prompt.text.trim().toLowerCase() || "toggle"
+        description: "Usage: /auto-review [on|off|toggle|status] or /auto-review fallback [on|off|toggle|status]",
+        execute: async ({ prompt }) => {
+          const [scope, argument] = prompt.text.trim().toLowerCase().split(/\s+/)
+          if (scope === "fallback" || scope === "human") {
+            const action = argument || "toggle"
+            if (action === "on" || action === "enable") setHumanFallback(true)
+            else if (action === "off" || action === "disable") setHumanFallback(false)
+            else if (action === "toggle") setHumanFallback(!humanFallback)
+            else if (action !== "status") {
+              showStatus("Usage: /auto-review fallback [on|off|toggle|status]")
+              return
+            }
+            showStatus(`Auto-review human fallback is ${humanFallback ? "enabled" : "disabled"}.`)
+            return
+          }
+          const action = scope || "toggle"
           if (action === "on" || action === "enable") setEnabled(true)
           else if (action === "off" || action === "disable") setEnabled(false)
           else if (action === "toggle") setEnabled(!enabled)
           else if (action !== "status") {
-            await showStatus(sessionID, delivery, "Usage: /auto-review [on|off|toggle|status]")
+            showStatus("Usage: /auto-review [on|off|toggle|status]")
             return
           }
-          await showStatus(sessionID, delivery, `Auto-review is ${enabled ? "enabled" : "disabled"}.`)
+          showStatus(`Auto-review is ${enabled ? "enabled" : "disabled"}.`)
         },
       })
     })
@@ -195,12 +232,13 @@ export default Plugin.define({
 
     // Capture committed originals before model dispatch, including compaction requests.
     //
-    // The host replays a committed synthetic body into later model requests as a
-    // user message, so every notice is removed again before dispatch (see
-    // `isNoticeBody`). The notice stays in the session transcript and is visible
-    // to the user; it just never reaches the coding model. The archive reads the
-    // session context independently, where a notice is a `synthetic` message
-    // rather than a `user` one, so this does not affect authorization.
+    // This plugin no longer writes any session message. The filter below only
+    // cleans up a notice body left in the transcript by an earlier version, which
+    // committed notices with `session.synthetic`. The host replays such a body into
+    // later model requests as a user message, so an upgraded install must strip it
+    // before dispatch (see `isNoticeBody`). The archive reads the session context
+    // independently, where a notice is a `synthetic` message rather than a `user`
+    // one, so this does not affect authorization.
     //
     // Both history-consuming dispatch hooks filter: V2 dispatches the agent loop
     // through `context` and checkpoint summaries through the separate `compaction`
@@ -237,8 +275,10 @@ export default Plugin.define({
 
       const humanReason = findHumanReviewReason(event.action, event.resources, options.humanReviewRules)
       if (humanReason) {
-        event.message = `Auto-review requires human confirmation: ${humanReason}`
+        // An explicit user rule is a deliberate confirmation requirement, not a
+        // fallback, so it asks even when the fallback is disabled.
         diagnose({ action: event.action, outcome: "human_rule" })
+        askHuman(event as PermissionEvent, humanReason)
         return
       }
 
@@ -253,12 +293,12 @@ export default Plugin.define({
         if (disposed || !enabled || controller.signal.aborted) return
         if (Date.now() >= deadline) {
           notifyReview(event.sessionID, event.action, key, "Automatic review reached its deadline")
-          askHuman(event as PermissionEvent, "Automatic review reached its deadline")
+          conclude(event as PermissionEvent, "Automatic review reached its deadline")
           return
         }
         diagnose({ action: event.action, request: key, outcome: outcome.code })
         const notices = outcome.notices ?? []
-        // Reviewer degradation is surfaced once, in the conversation timeline.
+        // Reviewer degradation is surfaced once, as a toast.
         const degraded = degradationReasons(outcome, notices)
         if (outcome.decision?.decision === "allow") {
           // A degraded approval already gets one notice describing the fallback, so
@@ -271,16 +311,22 @@ export default Plugin.define({
         }
         if (degraded.length) notifyReview(event.sessionID, event.action, key, degraded.join("; "))
         if (outcome.decision?.decision === "deny") denyPolicy(event as PermissionEvent, outcome.decision.reason ?? FAILURE_MESSAGE, notices)
-        else askHuman(event as PermissionEvent, outcome.decision?.reason ?? outcome.message ?? REVIEWER_FAILURE_MESSAGE, notices)
+        else conclude(event as PermissionEvent, outcome.decision?.reason ?? outcome.message ?? REVIEWER_FAILURE_MESSAGE, notices)
       } catch {
         if (!disposed) {
           const aborted = controller.signal.aborted
-          diagnose({ action: event.action, outcome: aborted ? "aborted" : "failure" })
           const timedOut = aborted && Date.now() >= deadline
-          const message = timedOut ? "Automatic review reached its deadline"
-            : aborted ? "Automatic review was cancelled" : REVIEWER_FAILURE_MESSAGE
-          if (!aborted || timedOut) notifyReview(event.sessionID, event.action, key, message)
-          askHuman(event as PermissionEvent, message)
+          if (aborted && !timedOut) {
+            // Cancellation is not a verdict. A new user turn or a disabled plugin
+            // must leave the event exactly as the host decided it; concluding here
+            // would turn a cancelled review into a denial.
+            diagnose({ action: event.action, outcome: "cancelled" })
+          } else {
+            const message = timedOut ? "Automatic review reached its deadline" : REVIEWER_FAILURE_MESSAGE
+            diagnose({ action: event.action, outcome: timedOut ? "timeout" : "failure" })
+            notifyReview(event.sessionID, event.action, key, message)
+            conclude(event as PermissionEvent, message)
+          }
         }
       } finally {
         activeControllers.delete(controller)
@@ -427,26 +473,31 @@ export default Plugin.define({
       }
     }
 
-    async function showStatus(sessionID: string, delivery: "steer" | "queue", text: string): Promise<void> {
-      // `resume: false` would park this in the bottom pending inbox. Commit it to
-      // the timeline instead so control feedback also scrolls with the session.
-      await ctx.session.synthetic({
-        sessionID,
-        text,
-        description: text,
-        delivery,
-        resume: true,
-      })
+    // Command feedback is a `notice` toast too. It used to be a session message,
+    // which resumed an idle session: `/auto-review status` from a user who was
+    // reading the transcript woke the coding model for a one-line reply.
+    function showStatus(text: string): void {
+      emitNotice(text, "info")
     }
 
-    function denyPolicy(event: PermissionEvent, reason: string, notices: readonly string[] = []): void {
+    function denyPolicy(event: PermissionEvent, reason: string, notices: readonly string[] = [], fromFallback = false): void {
       event.effect = "deny"
-      event.message = withNotices(denialMessage(reason), notices)
+      event.message = withNotices(fromFallback ? fallbackDenialMessage(reason) : denialMessage(reason), notices)
     }
 
     function askHuman(event: PermissionEvent, reason: string, notices: readonly string[] = []): void {
       event.effect = "ask"
       event.message = withNotices(`Auto-review requires human confirmation: ${reason.trim()}`, notices)
+    }
+
+    // A decision that needs a human is an `ask` by default. With `humanFallback`
+    // disabled the plugin must stay terminal: a prompt nobody answers blocks the
+    // session indefinitely during unattended work. Converting to `deny` keeps the
+    // loop moving, because the coding model receives the reason as a tool error and
+    // can adjust the call or continue without it.
+    function conclude(event: PermissionEvent, reason: string, notices: readonly string[] = []): void {
+      if (humanFallback) askHuman(event, reason, notices)
+      else denyPolicy(event, reason, notices, true)
     }
 
     return async () => {
@@ -456,7 +507,7 @@ export default Plugin.define({
       for (const controller of activeControllers.keys()) controller.abort()
       reviewerQueue.clear()
       reviewerStates.clear()
-      noticeTargets.clear()
+      noticeOrigins.clear()
       notified.clear()
       await registration.dispose()
       await commandRegistration.dispose()
@@ -474,14 +525,24 @@ function denialMessage(reason: string): string {
 }
 
 /**
- * The model-facing form of a committed synthetic notice.
+ * Denial used when the human fallback is disabled. The reviewer could not
+ * approve, and no human will answer, so the coding model is told to adjust or
+ * continue instead of waiting. It must not learn that a prompt was skipped.
+ */
+function fallbackDenialMessage(reason: string): string {
+  return `Auto-review did not approve this: ${reason.trim()} Adjust the request to one that is clearly authorized, or continue without it. Do not retry it unchanged or bypass this decision with obfuscation, indirection, shell expansion, or hidden output.`
+}
+
+/**
+ * The model-facing form of a legacy committed synthetic notice.
  *
- * A notice carries its text in `description` and leaves `text` empty, but the
- * host still replays it into later model requests as a `user` message whose only
- * parts are empty text (verified on OpenCode 2.0.6; the host does not drop an
- * empty synthetic body on its own). The `context` hook removes exactly that
- * shape before dispatch so a review notice never reaches the coding model, while
- * the notice itself stays in the session transcript for the user.
+ * This plugin no longer writes session messages, so nothing here is produced any
+ * more. A notice committed by an earlier version carries its text in
+ * `description` and leaves `text` empty, but the host still replays it into later
+ * model requests as a `user` message whose only parts are empty text (verified on
+ * OpenCode 2.0.6; the host does not drop an empty synthetic body on its own). The
+ * `context` hook removes exactly that shape before dispatch so an upgraded
+ * install cannot leak the old notice into the coding model's context.
  *
  * Matching on shape rather than a message id also strips notices committed by an
  * earlier plugin instance, which a per-instance id set could not know about.

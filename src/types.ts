@@ -39,7 +39,7 @@ export interface ReviewDecision {
 
 export interface ReviewerJournalState {
   checkpoint?: string
-  version: 2
+  version: 3
   epoch: number
   sourceLength: number
   sourceDigest: string

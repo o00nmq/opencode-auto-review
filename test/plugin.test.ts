@@ -42,6 +42,9 @@ function createHarness(
   let rpcDisposed = 0
   let rpcHandlers: Record<string, (input: any, context: any) => Promise<unknown>> | undefined
   const rpcEvents: { name: string; data: any }[] = []
+  const noticeToasts = () => rpcEvents
+    .filter((event) => event.name === "notice")
+    .map((event) => event.data as { description: string; severity: string })
   let generationSignal: AbortSignal | undefined
   const generatedPrompts: string[] = []
   const synthetic: string[] = []
@@ -58,10 +61,11 @@ function createHarness(
   if (options.model === null) delete pluginOptions.model
   // Session records for notice routing. Tests seed `ses_test` -> "ses_parent" to
   // model a subagent; an unseeded session is treated as a root session.
-  const sessions: Record<string, { parentID?: string; agent?: string; title?: string; error?: boolean }> = {}
+  const sessions: Record<string, { parentID?: string; agent?: string; title?: string; error?: boolean; hang?: boolean }> = {}
   const sessionInfo = (sessionID: string) => {
     const record = sessions[sessionID]
     if (record?.error) throw new Error(`session lookup failed: ${sessionID}`)
+    if (record?.hang) return new Promise<never>(() => undefined)
     return { id: sessionID, ...record }
   }
   const catalogModel: any = { providerID: "test", id: "reviewer", limit: { context: 128_000, input: 120_000, output: 8192 }, variants: [
@@ -179,14 +183,18 @@ function createHarness(
     async command(text: string) {
       assert.ok(command)
       await command({ sessionID: "ses_test", prompt: { text }, delivery: "steer" })
-      return synthetic.at(-1)
+      return noticeToasts().at(-1)?.description
     },
     counts: () => ({ generateCalls, contextCalls, disposed }),
     commandDescription: () => commandDescription,
-    visibleStatus: () => syntheticDescriptions.at(-1),
-    // Bottom pending-inbox items only; a committed timeline notice is not one.
+    // Command feedback is an `info` toast now, not a session message.
+    visibleStatus: () => noticeToasts().filter((toast) => toast.severity === "info").at(-1)?.description,
+    // Nothing may write to the session any more: a session message resumes an
+    // idle session. These stay for asserting emptiness.
     visibleMessages: () => syntheticCalls.filter((call) => call.resume === false).map((call) => call.text),
-    timelineNotices: () => syntheticCalls.filter((call) => call.resume !== false),
+    sessionWrites: () => syntheticCalls.slice(),
+    // CLI toasts. Every notice, including a clean approval, is one.
+    toasts: () => noticeToasts(),
     messages,
     generationSignal: () => generationSignal,
     generatedPrompts: () => generatedPrompts,
@@ -211,6 +219,10 @@ function createHarness(
       assert.ok(rpcHandlers?.setEnabled)
       return rpcHandlers.setEnabled({ enabled: value }, {})
     },
+    async rpcSetFallback(value: boolean) {
+      assert.ok(rpcHandlers?.setFallback)
+      return rpcHandlers.setFallback({ humanFallback: value }, {})
+    },
     rpcEvents: () => rpcEvents.slice(),
     rpcDisposed: () => rpcDisposed,
     catalogModel,
@@ -218,22 +230,19 @@ function createHarness(
   }
 }
 
-test("a committed notice is stripped from the dispatched model request", async () => {
-  // The host replays a committed synthetic body into later requests as a user
-  // message whose only part is empty text. That shape must never reach the model,
-  // while the notice itself stays in the session transcript for the user.
-  const harness = createHarness()
+test("a legacy notice body is stripped from the dispatched model request", async () => {
+  // This plugin no longer writes session messages, but an install upgraded from an
+  // earlier version still has committed notice bodies in its transcript, and the
+  // host replays one into later requests as a user message whose only part is
+  // empty text. The filter must keep removing that body.
+  const harness = createHarness({}, async () => { throw new Error("provider secret") })
   await harness.setup()
-  await harness.run()
-  const notice = harness.timelineNotices()[0]!
-  assert.equal(notice.text, "")
-  assert.equal(notice.description, "Auto-review approved read.")
+  const outcome = await harness.run()
+  assert.notEqual(outcome.effect, "allow")
   const replay = { role: "user", id: "notice-1", content: [{ type: "text", text: "" }] }
   const real = { role: "user", id: "user-1", content: [{ type: "text", text: "Read package.json" }] }
   const event = await harness.dispatch("ses_test", [real, replay])
   assert.deepEqual(event.messages, [real], "only the empty notice body is removed")
-  // The notice stays user-visible: it is still a committed timeline message.
-  assert.equal(harness.timelineNotices().length, 1)
 })
 
 test("a notice committed by an earlier plugin instance is still stripped", async () => {
@@ -282,9 +291,12 @@ test("only a valid eligible ask can be auto-allowed", async () => {
   assert.equal(event.effect, "allow")
   assert.equal((event as any).message, "Auto-review approved: read.")
   // A silent allow is indistinguishable from no review at all, so every approval
-  // leaves a timeline notice. The notice must not carry a reason.
-  const notice = harness.timelineNotices()[0]!
-  assert.equal(notice.description, "Auto-review approved read.")
+  // emits a CLI toast. The notice must not carry a reason, and an approval must
+  // not write to the session (that would resume it).
+  const toast = harness.toasts()[0]!
+  assert.equal(toast.description, "Auto-review approved read.")
+  assert.equal(toast.severity, "success")
+  assert.deepEqual(harness.sessionWrites(), [])
   assert.deepEqual(harness.visibleMessages(), [])
   assert.deepEqual(harness.counts(), { generateCalls: 1, contextCalls: 1, disposed: 0 })
   await cleanup?.()
@@ -314,13 +326,13 @@ test("a request reviewed again after its first notice still notifies", async () 
   await harness.setup()
   const first = await harness.run()
   assert.equal(first.effect, "allow")
-  assert.equal(harness.timelineNotices().length, 1)
+  assert.equal(harness.toasts().length, 1)
   // A second evaluation of the identical request happens after the shared review
   // settled, so it reviews again and must notify again.
   const second = await harness.run()
   assert.equal(second.effect, "allow")
   assert.equal(harness.counts().generateCalls, 2, "the settled request must be reviewed again")
-  assert.equal(harness.timelineNotices().length, 2, "the second review must notify too")
+  assert.equal(harness.toasts().length, 2, "the second review must notify too")
 })
 
 test("denial returns its permission reason in the tool error", async () => {
@@ -340,15 +352,16 @@ test("medium authorization is allowed and shows its rationale", async () => {
   assert.equal(event.effect, "allow")
   assert.equal((event as any).message, "Auto-review approved: Relevant but not explicitly authorized")
   // The rationale stays in the permission message, not in the approval notice.
-  const notice = harness.timelineNotices()[0]!
-  assert.equal(notice.description, "Auto-review approved read.")
-  assert.doesNotMatch(notice.description!, /Relevant but not explicitly authorized/)
+  const toast = harness.toasts()[0]!
+  assert.equal(toast.description, "Auto-review approved read.")
+  assert.doesNotMatch(toast.description, /Relevant but not explicitly authorized/)
 })
 
 test("runtime command toggles auto-review without restarting", async () => {
   const harness = createHarness({ enabled: false })
   await harness.setup()
   assert.match(harness.commandDescription(), /\/auto-review \[on\|off\|toggle\|status\]/)
+  assert.match(harness.commandDescription(), /fallback/)
   assert.equal((await harness.run()).effect, "ask")
   assert.equal(await harness.command("on"), "Auto-review is enabled.")
   assert.equal(harness.visibleStatus(), "Auto-review is enabled.")
@@ -379,25 +392,35 @@ test("human rules preserve confirmation while reviewer recursion remains ask", a
   assert.equal(harness.counts().generateCalls, 0)
 })
 
-test("malformed output exhausts bounded repair rounds and asks", async () => {
+test("malformed output exhausts bounded repair rounds and denies by default", async () => {
   const harness = createHarness({}, "not json")
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "ask")
+  assert.equal(event.effect, "deny")
   assert.match((event as any).message, /one format repair/)
   assert.equal(harness.counts().generateCalls, 2)
 })
 
-test("provider errors preserve human confirmation", async () => {
+test("provider errors deny by default and keep the reason", async () => {
   const harness = createHarness({}, async () => { throw new Error("provider secret") })
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "ask")
+  assert.equal(event.effect, "deny")
   assert.match((event as any).message, /reviewer model call failed/)
   assert.match((event as any).message, /provider secret/)
   assert.match((event as any).message, /not a safety judgment/)
+  assert.match((event as any).message, /Adjust the request/)
   assert.equal(harness.counts().generateCalls, 2)
   assert.deepEqual(harness.visibleMessages(), [], "failures must not leave pending synthetic inbox messages")
+})
+
+test("enabling the human fallback restores a prompt for the same failure", async () => {
+  const harness = createHarness({ humanFallback: true }, async () => { throw new Error("provider secret") })
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "ask")
+  assert.match((event as any).message, /human confirmation/)
+  assert.doesNotMatch((event as any).message, /Adjust the request/)
 })
 
 test("missing reviewer agent uses the OpenCode default model", async () => {
@@ -413,11 +436,11 @@ test("missing reviewer agent uses the OpenCode default model", async () => {
   assert.deepEqual(harness.visibleMessages(), [])
 })
 
-test("an unavailable reviewer model asks with the registration failure instead of silently proceeding", async () => {
+test("an unavailable reviewer model denies with the registration failure instead of silently proceeding", async () => {
   const harness = createHarness({ model: "test/absent" })
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "ask")
+  assert.equal(event.effect, "deny")
   assert.equal(harness.counts().generateCalls, 0)
   assert.match((event as any).message, /could not resolve a reviewer model/)
   assert.match((event as any).message, /test\/absent is not available/)
@@ -428,18 +451,19 @@ test("a missing reviewer variant reports the registration failure", async () => 
   const harness = createHarness({ model: "test/reviewer#missing" })
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "ask")
+  assert.equal(event.effect, "deny")
   assert.equal(harness.counts().generateCalls, 0)
   assert.match((event as any).message, /variant "missing" is not available/)
   assert.deepEqual(harness.visibleMessages(), [])
 })
 
-test("a clean reviewer ask does not emit a fallback notice", async () => {
+test("an explicit reviewer ask denies by default and does not emit a fallback notice", async () => {
   const harness = createHarness({}, JSON.stringify({ decision: "ask", risk: "unknown", authorization: "unknown",
     reason: "Confirm the deployment target", matched_rules: [] }))
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "ask")
+  assert.equal(event.effect, "deny")
+  assert.match((event as any).message, /Confirm the deployment target/)
   assert.deepEqual(harness.visibleMessages(), [])
 })
 
@@ -449,7 +473,7 @@ test("input budget follows current model limits and can exceed the old 64 KiB ce
   harness.messages[1].content[0].state.input = { path: "x".repeat(70_000) }
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "ask")
+  assert.equal(event.effect, "deny")
   assert.match((event as any).message, /model input budget/)
   assert.equal(harness.counts().generateCalls, 0)
   harness.catalogModel.limit = { context: 256_000, input: 220_000, output: 8192 }
@@ -463,7 +487,7 @@ test("review deadline aborts even a provider that ignores cancellation", async (
   const started = Date.now()
   const event = await harness.run()
   assert.ok(Date.now() - started >= 900)
-  assert.equal(event.effect, "ask")
+  assert.equal(event.effect, "deny")
   assert.equal(harness.counts().generateCalls, 1)
   assert.equal(harness.generationSignal()?.aborted, true)
 })
@@ -520,12 +544,12 @@ test("permission evaluation executes multiple evidence rounds before applying a 
   assert.equal(harness.counts().generateCalls, 3)
 })
 
-test("an explicit reviewer ask returns its question to the human", async () => {
+test("an explicit reviewer ask denies by default with its question as the reason", async () => {
   const harness = createHarness({}, JSON.stringify({ decision: "ask", risk: "unknown", authorization: "unknown",
     reason: "Confirm the target deployment environment", matched_rules: [] }))
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "ask")
+  assert.equal(event.effect, "deny")
   assert.match((event as any).message, /Confirm the target deployment environment/)
 })
 
@@ -558,7 +582,7 @@ test("a hung context read does not block the next same-session review after its 
   const harness = createHarness({ timeoutMs: 1000 }, allowText,
     async () => hang ? new Promise(() => undefined) : harness.messages)
   await harness.setup()
-  assert.equal((await harness.run()).effect, "ask")
+  assert.equal((await harness.run()).effect, "deny")
   hang = false
   await new Promise((done) => setImmediate(done))
   assert.equal((await harness.run()).effect, "allow")
@@ -577,9 +601,9 @@ test("independent sessions run concurrently while identical in-flight requests s
     release({ text: allowText })
     assert.ok((await Promise.all(pending)).every(event => event.effect === "allow"))
     // The two identical "one" evaluations share one review, so they must also
-    // share one notice: five requests, five notices, none duplicated.
+    // share one notice: five requests, five toasts, none duplicated.
     assert.equal(harness.counts().generateCalls, 5)
-    assert.equal(harness.timelineNotices().length, 5)
+    assert.equal(harness.toasts().length, 5)
   } finally {
     release({ text: allowText })
     await cleanup?.()
@@ -610,7 +634,7 @@ test("a hung verification read does not permanently wedge shared reviewer-model 
   }
   const harness = createHarness({ timeoutMs: 1000, modelOptions: { body: { max_tokens: 512 } } }, allowText, undefined, modelDomain)
   await harness.setup()
-  assert.equal((await harness.run({ sessionID: "one" })).effect, "ask", "a stalled verification must not approve")
+  assert.equal((await harness.run({ sessionID: "one" })).effect, "deny", "a stalled verification must not approve")
   hang = false
   // Retry rather than assume a fixed number of event-loop turns: the stalled
   // attempt is released by its own timeout, which need not land before one
@@ -672,15 +696,44 @@ test("default Chat budget preserves the selected native reasoning variant", asyn
 test("the RPC contract and the slash command share one toggle state and emit state events", async () => {
   const harness = createHarness()
   await harness.setup()
-  assert.deepEqual(await harness.rpcStatus(), { enabled: true })
+  assert.deepEqual(await harness.rpcStatus(), { enabled: true, humanFallback: false })
   await harness.rpcSetEnabled(false)
-  assert.deepEqual(await harness.rpcStatus(), { enabled: false })
+  assert.deepEqual(await harness.rpcStatus(), { enabled: false, humanFallback: false })
   assert.equal((await harness.run()).effect, "ask")
   assert.equal(await harness.command("on"), "Auto-review is enabled.")
-  assert.deepEqual(await harness.rpcStatus(), { enabled: true })
+  assert.deepEqual(await harness.rpcStatus(), { enabled: true, humanFallback: false })
   assert.equal((await harness.run()).effect, "allow")
-  assert.deepEqual(harness.rpcEvents().map((event) => event.name), ["state", "state"])
-  assert.deepEqual(harness.rpcEvents().map((event) => (event.data as { enabled: boolean }).enabled), [false, true])
+  assert.deepEqual(harness.rpcEvents().filter((event) => event.name === "state").map((event) => event.name), ["state", "state"])
+  assert.deepEqual(harness.rpcEvents().filter((event) => event.name === "state").map((event) => (event.data as { enabled: boolean }).enabled), [false, true])
+})
+
+test("the human fallback toggles over RPC and the slash command", async () => {
+  // Default: the fallback is off, so a reviewer that cannot approve denies and an
+  // unattended session cannot stall on a prompt nobody answers.
+  const harness = createHarness({}, async () => { throw new Error("provider secret") })
+  await harness.setup()
+  const denied = await harness.run()
+  assert.equal(denied.effect, "deny")
+  assert.match(String((denied as { message?: string }).message), /Adjust the request/)
+  assert.doesNotMatch(String((denied as { message?: string }).message), /human confirmation/i)
+
+  assert.deepEqual(await harness.rpcSetFallback(true), { enabled: true, humanFallback: true })
+  assert.equal((await harness.run()).effect, "ask")
+
+  assert.equal(await harness.command("fallback off"), "Auto-review human fallback is disabled.")
+  assert.equal((await harness.run()).effect, "deny")
+  assert.equal(await harness.command("fallback status"), "Auto-review human fallback is disabled.")
+  assert.equal(await harness.command("fallback"), "Auto-review human fallback is enabled.")
+  assert.equal(await harness.command("fallback bogus"), "Usage: /auto-review fallback [on|off|toggle|status]")
+})
+
+test("an explicit human rule still asks when the fallback is off", async () => {
+  // A configured rule is a deliberate confirmation requirement, not a fallback.
+  const harness = createHarness({ humanReviewRules: [{ action: "read", resource: "*", reason: "always confirm" }] })
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "ask")
+  assert.match(String((event as { message?: string }).message), /always confirm/)
 })
 
 test("the compaction hook captures original history like the context hook", async () => {
@@ -691,123 +744,128 @@ test("the compaction hook captures original history like the context hook", asyn
   assert.equal(harness.counts().contextCalls, 1)
 })
 
-test("reviewer degradation is reported as a committed timeline notice, not an inbox item", async () => {
+test("reviewer degradation is reported as a toast and never writes to the session", async () => {
   const harness = createHarness({}, async () => { throw new Error("provider secret") })
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "ask")
+  assert.equal(event.effect, "deny")
   assert.deepEqual(harness.visibleMessages(), [], "failures must not leave pending synthetic inbox messages")
-  const notices = harness.timelineNotices()
-  assert.equal(notices.length, 1)
-  const notice = notices[0]!
-  assert.equal(notice.sessionID, "ses_test", "the notice must be attributed to the reviewed session")
-  assert.equal(notice.resume, true)
-  // The timeline paints `description`, so the reason must live there.
-  assert.match(notice.description!, /reviewer model call failed/)
-  assert.match(notice.description!, /provider secret/)
-  // `text` is empty so the notice never reaches the coding model's context.
-  assert.equal(notice.text, "")
-  assert.ok(notice.metadata?.request, "the notice must carry the request identity")
+  assert.deepEqual(harness.sessionWrites(), [], "a notice must never write to the session")
+  const toasts = harness.toasts()
+  assert.equal(toasts.length, 1)
+  assert.match(toasts[0]!.description, /reviewer model call failed/)
+  assert.match(toasts[0]!.description, /provider secret/)
 })
 
-test("a degraded approval emits one notice whose content stays out of `text`", async () => {
+test("a degraded approval emits one toast and no session write", async () => {
   const harness = createHarness({ model: null })
   await harness.setup()
   const event = await harness.run()
   assert.equal(event.effect, "allow")
   // The degraded approval gets exactly one notice: describing the fallback, not
   // the fallback notice plus a second plain approval notice.
-  const notices = harness.timelineNotices()
-  assert.equal(notices.length, 1)
-  const notice = notices[0]!
-  assert.match(notice.description!, /catalog default model test\/reviewer/)
-  assert.equal(notice.text, "")
+  const toasts = harness.toasts()
+  assert.equal(toasts.length, 1)
+  assert.match(toasts[0]!.description, /catalog default model test\/reviewer/)
+  assert.deepEqual(harness.sessionWrites(), [])
 })
 
-test("a subagent's notice is routed to the root session and names its origin", async () => {
+test("a subagent's notice names its origin and never writes to a session", async () => {
   const harness = createHarness({}, async () => { throw new Error("subagent failure") })
   harness.sessions["ses_test"] = { parentID: "ses_parent", agent: "review", title: "Inspect the fixture" }
   harness.sessions["ses_parent"] = { agent: "build" }
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "ask")
-  const notices = harness.timelineNotices()
-  assert.equal(notices.length, 1)
-  const notice = notices[0]!
-  assert.equal(notice.sessionID, "ses_parent", "a subagent notice must surface in the root conversation")
-  assert.match(notice.description!, /review subagent/)
-  assert.match(notice.description!, /Inspect the fixture/)
-  assert.match(notice.description!, /reviewer model call failed/)
-  // A subagent notice must be visible to the user only, never to the model.
-  assert.equal(notice.text, "")
+  assert.equal(event.effect, "deny")
+  const toasts = harness.toasts()
+  assert.equal(toasts.length, 1)
+  assert.match(toasts[0]!.description, /review subagent/)
+  assert.match(toasts[0]!.description, /Inspect the fixture/)
+  assert.match(toasts[0]!.description, /reviewer model call failed/)
+  // The wake regression: routing used to post a message into the idle root
+  // session, which resumed the parent model.
+  assert.deepEqual(harness.sessionWrites(), [])
 })
 
-test("a nested subagent notice still resolves to the top-level session", async () => {
+test("a nested subagent notice still names the originating subagent", async () => {
   const harness = createHarness({}, async () => { throw new Error("nested failure") })
   harness.sessions["ses_test"] = { parentID: "ses_mid", agent: "explore" }
   harness.sessions["ses_mid"] = { parentID: "ses_root", agent: "review" }
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "ask")
-  const notices = harness.timelineNotices()
-  assert.equal(notices.length, 1)
-  assert.equal(notices[0]!.sessionID, "ses_root")
-  assert.match(notices[0]!.description!, /explore subagent/)
-  assert.equal(notices[0]!.text, "")
+  assert.equal(event.effect, "deny")
+  const toasts = harness.toasts()
+  assert.equal(toasts.length, 1)
+  assert.match(toasts[0]!.description, /explore subagent/)
+  assert.deepEqual(harness.sessionWrites(), [])
 })
 
 test("a root session notice needs no origin annotation", async () => {
   const harness = createHarness({}, async () => { throw new Error("failure") })
   await harness.setup()
-  assert.equal((await harness.run()).effect, "ask")
-  const notice = harness.timelineNotices()[0]!
-  assert.equal(notice.sessionID, "ses_test")
-  assert.doesNotMatch(notice.description!, /subagent/)
+  assert.equal((await harness.run()).effect, "deny")
+  assert.doesNotMatch(harness.toasts()[0]!.description, /subagent/)
 })
 
-test("a session lookup failure falls back to the reviewed session instead of dropping the notice", async () => {
+test("a session lookup failure still reports the notice without writing to a session", async () => {
   const harness = createHarness({}, async () => { throw new Error("failure") })
   harness.sessions["ses_test"] = { error: true }
   await harness.setup()
   const event = await harness.run()
-  assert.equal(event.effect, "ask")
-  const notices = harness.timelineNotices()
-  assert.equal(notices.length, 1)
-  assert.equal(notices[0]!.sessionID, "ses_test")
-})
+  assert.equal(event.effect, "deny")
+  const toasts = harness.toasts()
+  assert.equal(toasts.length, 1)})
 
-test("a model fallback is surfaced once in the timeline even for an approval", async () => {
+test("a model fallback is surfaced once even for an approval", async () => {
   const harness = createHarness({ model: null })
   await harness.setup()
   const event = await harness.run()
   assert.equal(event.effect, "allow")
   assert.match((event as any).message, /auto-review fallback/)
-  const notices = harness.timelineNotices()
-  assert.equal(notices.length, 1)
-  assert.match(notices[0]!.description!, /catalog default model test\/reviewer/)
+  const toasts = harness.toasts()
+  assert.equal(toasts.length, 1)
+  assert.match(toasts[0]!.description, /catalog default model test\/reviewer/)
   assert.deepEqual(harness.visibleMessages(), [])
+  assert.deepEqual(harness.sessionWrites(), [])
 })
 
-test("every automatic approval leaves a reason-free timeline notice", async () => {
+test("every automatic approval leaves a reason-free toast and no session write", async () => {
   const harness = createHarness()
   await harness.setup()
   assert.equal((await harness.run()).effect, "allow")
-  // This replaces the former "a clean reviewer decision emits no timeline notice":
-  // a fully automatic allow must still be visible as a review that happened.
-  const notices = harness.timelineNotices()
-  assert.equal(notices.length, 1)
-  assert.equal(notices[0]!.description, "Auto-review approved read.")
-  assert.equal(notices[0]!.resume, true)
-  // The notice carries its content in `description` and leaves `text` empty, which
-  // is the field the host assembles into the model request.
-  assert.equal(notices[0]!.text, "")
+  const toasts = harness.toasts()
+  assert.equal(toasts.length, 1)
+  assert.equal(toasts[0]!.description, "Auto-review approved read.")
+  assert.equal(toasts[0]!.severity, "success")
+  // An approval is toast-only: it must not commit a session message, because that
+  // would resume an idle session.
+  assert.deepEqual(harness.sessionWrites(), [])
 })
 
-test("the explicit status command commits its output to the timeline instead of the inbox", async () => {
+test("the status command answers with a toast and writes nothing to the session", async () => {
   const harness = createHarness()
   await harness.setup()
   assert.equal(await harness.command("status"), "Auto-review is enabled.")
   assert.deepEqual(harness.visibleMessages(), [])
-  assert.equal(harness.timelineNotices().length, 1)
-  assert.equal(harness.timelineNotices()[0]!.resume, true)
+  assert.deepEqual(harness.sessionWrites(), [])
+  assert.equal(harness.toasts().at(-1)!.severity, "info")
+})
+
+test("a session lookup that never settles still delivers the notice", async () => {
+  // The origin annotation is best-effort; a stuck session query must not delay the
+  // notice forever.
+  const harness = createHarness({}, async () => { throw new Error("failure") })
+  harness.sessions["ses_test"] = { hang: true }
+  await harness.setup()
+  const started = Date.now()
+  const event = await harness.run()
+  assert.equal(event.effect, "deny")
+  const giveUpAt = Date.now() + 5_000
+  while (harness.toasts().length === 0 && Date.now() < giveUpAt) {
+    await new Promise((done) => setTimeout(done, 50))
+  }
+  assert.ok(Date.now() - started < 5_000, "the notice must not wait on an unbounded lookup")
+  assert.equal(harness.toasts().length, 1)
+  assert.doesNotMatch(harness.toasts()[0]!.description, /subagent/)
+  assert.deepEqual(harness.sessionWrites(), [])
 })
