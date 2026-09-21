@@ -18,12 +18,13 @@ interface Tool {
 interface Archive {
   messages: Message[]
   checkpoints: { id: string; length: number }[]
-  complete: boolean
 }
 
 /** Original evidence lives in storage; only a bounded selection enters model context. */
 export class ReviewArchive {
   readonly #queue = new KeyedQueue()
+  // Sessions this instance has loaded at least once. Distinguishes a checkpoint
+  // that formed while we were watching from one we are seeing for the first time.
   readonly #observed = new Set<string>()
 
   constructor(
@@ -70,15 +71,17 @@ export class ReviewArchive {
         checkpoints: !id ? [] : known >= 0
           ? previous!.checkpoints.slice(0, known + 1)
           : [...(previous?.checkpoints ?? []), { id, length }],
-        // A checkpoint created while this plugin was absent may cover unseen instructions.
-        complete: !id || (previous?.complete === true && (known >= 0 || this.#observed.has(sessionID))),
       }
       await this.storage.set(key, JSON.parse(JSON.stringify(archive)))
-      this.#observed.add(sessionID)
       // The checkpoint is background only. Never append the accumulated summary chain.
       const view: unknown[] = [...archive.messages]
       if (checkpoint) view.splice(length, 0, checkpoint)
-      return { messages: view, complete: archive.complete }
+      // Informational, never latching: this boundary was reconstructed rather
+      // than observed as it formed, so originals behind it may be partial. It
+      // must not change the decision.
+      const reconstructed = id !== undefined && known < 0 && !this.#observed.has(sessionID)
+      this.#observed.add(sessionID)
+      return { messages: view, reconstructed }
     })
   }
 

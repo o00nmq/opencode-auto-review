@@ -474,11 +474,30 @@ test("input budget follows current model limits and can exceed the old 64 KiB ce
   await harness.setup()
   const event = await harness.run()
   assert.equal(event.effect, "deny")
-  assert.match((event as any).message, /model input budget/)
+  assert.match((event as any).message, /reviewer model's input budget/)
   assert.equal(harness.counts().generateCalls, 0)
   harness.catalogModel.limit = { context: 256_000, input: 220_000, output: 8192 }
   assert.equal((await harness.run()).effect, "allow")
   assert.ok(Buffer.byteLength(harness.generatedPrompts()[0]!, "utf8") > 65_536)
+})
+
+test("a user instruction too large for the reviewer budget denies instead of approving without it", async () => {
+  // The governing instruction is mandatory. When it cannot fit, the review is
+  // refused rather than falling back to an older instruction that the latest one
+  // may have superseded.
+  const harness = createHarness()
+  harness.catalogModel.limit = { context: 16_000, input: 8000, output: 8192 }
+  harness.messages.splice(0, harness.messages.length,
+    { id: "first", type: "user", text: "Read package.json" },
+    { id: "governing", type: "user", text: `Only read package.json. ${"x".repeat(70_000)}` },
+    { id: "assistant", type: "assistant", content: [
+      { type: "tool", id: "tool", name: "read", state: { status: "running", input: { path: "package.json" } } },
+    ] },
+  )
+  await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "deny")
+  assert.equal(harness.counts().generateCalls, 0, "the reviewer must not decide without the governing instruction")
 })
 
 test("review deadline aborts even a provider that ignores cancellation", async () => {
@@ -736,12 +755,112 @@ test("an explicit human rule still asks when the fallback is off", async () => {
   assert.match(String((event as { message?: string }).message), /always confirm/)
 })
 
+test("a pre-compaction user restriction still reaches the reviewer", async () => {
+  // Authorization is not backlog: user instructions survive the compaction
+  // boundary even though the tool history before it does not. Losing them would
+  // discard real authorization and remove the guarantee that an automatic
+  // approval rests on a disclosed user instruction.
+  const harness = createHarness()
+  await harness.setup()
+  harness.messages.splice(0, harness.messages.length,
+    { id: "restriction", type: "user", text: "Only read files under src" },
+    { id: "oldTool", type: "assistant", content: [
+      { type: "tool", id: "tool-old", name: "read", state: { status: "completed", input: { path: "src/a.ts" },
+        content: [{ type: "text", text: "PRE_BOUNDARY_SECRET" }] } },
+    ] },
+  )
+  // The plugin observes the session first; the session then compacts, so the
+  // context becomes the summary plus what follows it.
+  await harness.dispatch("ses_test", harness.messages)
+  harness.messages.splice(0, harness.messages.length,
+    { id: "compact", type: "compaction", status: "completed", summary: "Working on the task", recent: "Continue" },
+    { id: "user2", type: "user", text: "Read package.json" },
+    { id: "assistant", type: "assistant", content: [
+      { type: "tool", id: "tool", name: "read", state: { status: "running", input: { path: "package.json" } } },
+    ] },
+  )
+  const event = await harness.run()
+  assert.equal(event.effect, "allow")
+  const prompt = harness.generatedPrompts()[0]!
+  assert.match(prompt, /Only read files under src/, "pre-compaction authorization must survive the boundary")
+  assert.doesNotMatch(prompt, /PRE_BOUNDARY_SECRET/, "the pre-compaction tool backlog must not enter the prompt")
+})
+
+test("a pre-compaction tool result stays retrievable by id without entering the prompt", async () => {
+  // The prompt drops the pre-compaction tool backlog, but evidence is lazily
+  // addressable over the whole transcript, so the reviewer can still verify an
+  // earlier inspection instead of being forced to ask about material the coding
+  // model already saw. This is the shape the live compaction smoke test relies on.
+  let round = 0
+  const harness = createHarness({}, async () => ({ text: round++ === 0
+    ? JSON.stringify({ decision: "investigate", reason: "Verify the earlier inspection",
+      requests: [{ type: "tool_result", messageID: "oldTool", toolID: "tool-old", offset: 0 }] })
+    : allowText }))
+  await harness.setup()
+  harness.messages.splice(0, harness.messages.length,
+    { id: "restriction", type: "user", text: "Only read files under src" },
+    { id: "oldTool", type: "assistant", content: [
+      { type: "tool", id: "tool-old", name: "read", state: { status: "completed", input: { path: "src/a.ts" },
+        content: [{ type: "text", text: "PRE_BOUNDARY_SECRET" }] } },
+    ] },
+  )
+  await harness.dispatch("ses_test", harness.messages)
+  harness.messages.splice(0, harness.messages.length,
+    { id: "compact", type: "compaction", status: "completed", summary: "Working on the task", recent: "Continue" },
+    { id: "user2", type: "user", text: "Read package.json" },
+    { id: "assistant", type: "assistant", content: [
+      { type: "tool", id: "tool", name: "read", state: { status: "running", input: { path: "package.json" } } },
+    ] },
+  )
+  const event = await harness.run()
+  assert.equal(event.effect, "allow")
+  assert.doesNotMatch(harness.generatedPrompts()[0]!, /PRE_BOUNDARY_SECRET/)
+  assert.match(harness.generatedPrompts()[1]!, /PRE_BOUNDARY_SECRET/, "the original must come back as evidence")
+})
+
+test("a window with no user instruction cannot produce an automatic approval", async () => {
+  // The compaction summary is context, not authorization; without a user
+  // instruction there is nothing that could authorize the pending action.
+  const harness = createHarness()
+  await harness.setup()
+  harness.messages.splice(0, harness.messages.length,
+    { id: "compact", type: "compaction", status: "completed", summary: "Continue the task", recent: "" },
+    { id: "assistant", type: "assistant", content: [
+      { type: "tool", id: "tool", name: "read", state: { status: "running", input: { path: "package.json" } } },
+    ] },
+  )
+  const event = await harness.run()
+  assert.notEqual(event.effect, "allow")
+  assert.equal(harness.counts().generateCalls, 0, "the reviewer must not be asked to authorize a request with no user instruction")
+})
+
 test("the compaction hook captures original history like the context hook", async () => {
   const harness = createHarness()
   await harness.setup()
   assert.equal(harness.counts().contextCalls, 0)
   await harness.compact()
   assert.equal(harness.counts().contextCalls, 1)
+})
+
+test("a compaction the plugin never observed still reviews routine work instead of denying it", async () => {
+  // The main session compacted while the plugin was not loaded, so there is no
+  // observed pre-compaction prefix. The review window is anchored at that
+  // checkpoint and its summary stands in for the earlier instructions, exactly
+  // as it does for the coding model, so the session must not be locked into
+  // denying every later request for missing history.
+  const harness = createHarness()
+  await harness.setup()
+  harness.messages.splice(0, harness.messages.length,
+    { id: "compact", type: "compaction", status: "completed", summary: "The user asked to read package.json", recent: "Continue" },
+    { id: "user", type: "user", text: "Read package.json" },
+    { id: "assistant", type: "assistant", content: [
+      { type: "tool", id: "tool", name: "read", state: { status: "running", input: { path: "package.json" } } },
+    ] },
+  )
+  const event = await harness.run()
+  assert.equal(event.effect, "allow")
+  assert.deepEqual(harness.sessionWrites(), [])
+  assert.equal(harness.toasts().at(-1)!.severity, "success")
 })
 
 test("reviewer degradation is reported as a toast and never writes to the session", async () => {

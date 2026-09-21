@@ -6,6 +6,16 @@ import { estimateTokens } from "./context-budget.js"
 const USER_BUDGET_SHARE = 0.6
 const TOOL_BUDGET_SHARE = 0.3
 const COMPACTION_BUDGET_SHARE = 0.1
+// Optional entries stop below the budget so a subsequent review can append to the
+// journal. Without it a selection that filled the budget to its last token would
+// force a new epoch on the very next append, and the rebuilt selection would fill
+// again, making a rebuild the steady state — every review restarting the prompt
+// and losing the provider's cached prefix. Every pass stops at this limit, not
+// just the borrowing fill, and the limit is measured against the flexible space
+// (budget minus fixed framing) so a small budget or a large fixed part cannot
+// switch it off. Appends still erode this headroom, so the honest effect is that
+// rebuilds become periodic rather than per-review.
+const RETENTION_SHARE = 0.75
 
 export interface PreparedReviewJournal extends ReviewerJournalState {
   prompt: string
@@ -55,25 +65,40 @@ function startEpoch(
   const currentTool = current
   const historical = request.context.slice(0, -1)
   const selected = new Set<number>()
+  const users = indexesOf(historical, "user")
+  // The latest user instruction governs the pending request, so it is mandatory
+  // rather than budgeted: if even it does not fit, the review is refused instead
+  // of silently approving against an older, possibly superseded, instruction.
+  if (users.length) selected.add(users.at(-1)!)
   const minimum = epochLines(epoch, request, historical, selected, currentTool)
-  const available = maxInputTokens - promptTokens(minimum, reasoningTokens)
+  const minimumTokens = promptTokens(minimum, reasoningTokens)
+  const available = maxInputTokens - minimumTokens
   if (available < 0) return
+  // Headroom is measured against the flexible space, not the whole prompt. The
+  // fixed part (policy text, epoch line, review line) can already be a large
+  // share of a small budget; an absolute fraction would then leave no room at all
+  // and switch the borrowing fill off entirely.
+  const retentionLimit = minimumTokens + Math.floor(available * RETENTION_SHARE)
 
   const remaining = {
     user: Math.floor(available * USER_BUDGET_SHARE),
     tool: Math.floor(available * TOOL_BUDGET_SHARE),
     compaction: Math.floor(available * COMPACTION_BUDGET_SHARE),
   }
-  const users = indexesOf(historical, "user")
   const tools = indexesOf(historical, "tool")
   const compactions = indexesOf(historical, "compaction")
 
-  const anchoredUsers = unique([users[0], users.at(-1), ...users.slice(1, -1).reverse()])
+  const anchoredUsers = unique([users[0], ...users.slice(1, -1).reverse()])
   addWithinBudget(anchoredUsers, "user")
   addWithinBudget([...compactions].reverse(), "compaction")
   addWithinBudget([...tools].reverse(), "tool")
 
-  // Let categories borrow unused capacity without changing their priority order.
+  // Let categories borrow unused capacity without changing their priority
+  // order. The borrowing fill is bounded so a saturated selection still leaves
+  // the journal room to append, instead of forcing a rebuild on the next review
+  // that would fill again and make that the steady state. If the bounded
+  // selection omits a user instruction, the host refuses an automatic allow until
+  // it is recovered through history evidence.
   addWithinBudget(anchoredUsers, undefined)
   addWithinBudget([...compactions].reverse(), undefined)
   addWithinBudget([...tools].reverse(), undefined)
@@ -87,7 +112,10 @@ function startEpoch(
       const cost = estimateTokens(serialize(historical[index]!))
       if (category && cost > remaining[category]) continue
       const next = new Set(selected).add(index)
-      if (promptTokens(epochLines(epoch, request, historical, next, currentTool), reasoningTokens) > maxInputTokens) continue
+      // Every pass, priority or borrowing, stops at the retention limit, so the
+      // headroom holds however the selection is composed — not only when one
+      // category saturates it.
+      if (promptTokens(epochLines(epoch, request, historical, next, currentTool), reasoningTokens) > retentionLimit) continue
       selected.add(index)
       if (category) remaining[category] -= cost
     }
@@ -117,7 +145,6 @@ function epochLines(
         tools: total.tools - retained.tools,
         compactions: total.compactions - retained.compactions,
       },
-      source_history_truncated: request.history_truncated,
     }),
     ...historical.flatMap((entry, index) => selected.has(index) ? [serialize(entry)] : []),
     serialize(reviewLine(current, request)),

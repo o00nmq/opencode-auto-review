@@ -17,7 +17,6 @@ export interface PermissionEvent {
 export interface ReviewRequest {
   checkpoint?: string
   context: ReviewContextEntry[]
-  history_truncated: boolean
   permission: {
     action: string
     resources: readonly string[]

@@ -379,7 +379,9 @@ export default Plugin.define({
         Math.floor(maxInputTokens * 0.75) - estimateTokens(JSON.stringify(evidence.index)),
         options.maxReviewTokens,
       )
-      if (!prepared) return { code: "context_limit", message: "The complete tool request is too large for the model input budget", notices }
+      if (!prepared) {
+        return { code: "context_limit", message: "The review window (user instructions, recent actions, and the current request) does not fit the reviewer model's input budget", notices }
+      }
       const { prompt: _prompt, ...state } = prepared
       const outcome = await runReviewLoop({
         lines: state.lines,
@@ -461,11 +463,17 @@ export default Plugin.define({
         const retained = await raceWithAbort(archive.load(event.sessionID, signal), signal)
         const messages = retained.messages
         if (signal.aborted) return
+        // Informational only: a reconstructed boundary is still a valid window
+        // anchor, so it must never change the decision.
+        if (retained.reconstructed) diagnose({ action: event.action, outcome: "archive_checkpoint_reconstructed" })
+        // The prompt is projected by `buildReviewRequest` (user instructions, a
+        // bounded tail of recent actions, and post-compaction tool history);
+        // evidence stays lazily addressable over the whole captured transcript so
+        // an original result can still be recovered by ID without entering the
+        // prompt.
         const request = buildReviewRequest(messages, event)
         if (request) {
-          request.history_truncated = !retained.complete
           return { request, evidence: captureEvidence(messages, event, {
-            complete: retained.complete,
             result: (messageID, toolID) => archive.result(event.sessionID, messageID, toolID),
           }) }
         }

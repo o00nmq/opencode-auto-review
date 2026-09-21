@@ -36,7 +36,9 @@ Automatic review is enabled by default, with **2,048 output tokens** and **90 se
 
 `/auto-review [on|off|toggle|status]`, or the palette's **Toggle Auto-review**. The TUI reads and changes this state over the plugin RPC contract instead of parsing session text; the slash command keeps its explicit status output.
 
-The plugin handles eligible requests that would otherwise ask for permission. It can consult earlier user instructions and tool results when needed, including after the main conversation is compacted. Its feedback is limited to permission and safety decisions.
+The plugin handles eligible requests that would otherwise ask for permission. It reviews each request against the task the main conversation is actually working on: your instructions are kept across a compaction, while the tool history before it is dropped so the reviewer carries no backlog the coding model has already shed. Recent actions are kept so a once-only instruction is not replayed, and an earlier tool result can still be retrieved by ID when a decision depends on it. For a boundary that must hold no matter what, use `humanReviewRules` or your own host `deny`/`ask` rules. Its feedback is limited to permission and safety decisions.
+
+The reviewer reads your instructions, so treat the reviewer model as part of the session's trust boundary: pick one you would trust with the session's user text, especially when it is a different provider from the coding model.
 
 By default the plugin never waits for a human: a request the reviewer cannot approve becomes a **denial** whose reason tells the model what was missing, so unattended runs cannot stall. Use `/auto-review fallback on` to prompt instead. An explicit `humanReviewRules` entry always prompts.
 

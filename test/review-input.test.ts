@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { buildReviewRequest } from "../src/review-input.js"
+import { buildReviewRequest, reviewWindow } from "../src/review-input.js"
 import type { PermissionEvent } from "../src/types.js"
 
 const event: PermissionEvent = {
@@ -37,7 +37,6 @@ test("extracts bounded user and tool history while isolating the exact current t
       { type: "user", text: "Check the repository status" },
       { type: "tool", name: "shell", input: { command: "git status" } },
     ],
-    history_truncated: false,
     permission: { action: "shell", resources: ["git status"] },
   })
 })
@@ -53,23 +52,54 @@ test("rejects partial or unlocatable requests", () => {
   assert.equal(buildReviewRequest([{ id: "msg_source", type: "assistant", content: [] }], event), undefined)
 })
 
-test("preserves available pre-compaction user authorization and marks history incomplete", () => {
+test("the review window keeps user authorization and recent actions across a compaction", () => {
   const compaction = {
     id: "compact", type: "compaction", status: "completed", reason: "auto",
     summary: "The user authorized deployment", recent: "Continue the task",
   }
+  const preTool = { id: "old", type: "assistant", content: [
+    { type: "tool", id: "tool_old", name: "shell", state: { status: "completed", input: { command: "deploy --once" }, content: [] } },
+  ] }
   const source = { id: "msg_source", type: "assistant", content: [
     { type: "tool", id: "tool_target", name: "shell", state: { status: "running", input: { command: "git status" } } },
   ] }
-  const retained = buildReviewRequest([{ id: "old", type: "user", text: "Deploy" }, compaction, source], event)
-  assert.deepEqual(retained?.context[0], { type: "user", text: "Deploy" })
-  assert.equal(retained?.history_truncated, true)
-  assert.equal(buildReviewRequest([compaction, source], event), undefined)
+  const messages = [
+    { id: "early", type: "user", text: "Deploy only to staging" },
+    preTool,
+    compaction,
+    { id: "latest", type: "user", text: "Check the repository status" },
+    source,
+  ]
 
-  const request = buildReviewRequest([compaction, { id: "new", type: "user", text: "Check status only" }, source], event)
-  assert.deepEqual(request?.context[0], {
-    type: "compaction", summary: "The user authorized deployment", recent: "Continue the task",
-  })
+  // Authorization survives the boundary, and a recent prior action survives with
+  // it: without that, a once-scoped authorization would be invisible after it was
+  // consumed and the reviewer could not tell a first use from a replay.
+  assert.deepEqual(reviewWindow(messages, event)?.map((message: any) => message.id),
+    ["early", "old", "compact", "latest", "msg_source"])
+  assert.deepEqual(buildReviewRequest(messages, event)?.context, [
+    { type: "user", text: "Deploy only to staging" },
+    { type: "tool", name: "shell", input: { command: "deploy --once" } },
+    { type: "compaction", summary: "The user authorized deployment", recent: "Continue the task" },
+    { type: "user", text: "Check the repository status" },
+    { type: "tool", name: "shell", input: { command: "git status" } },
+  ])
+
+  // Actions beyond the retained tail are backlog and are dropped.
+  const older = Array.from({ length: 20 }, (_, index) => ({ id: `t${index}`, type: "assistant", content: [
+    { type: "tool", id: `tool-t${index}`, name: "read", state: { status: "completed", input: { path: `f${index}.ts` } } },
+  ] }))
+  const wide = [{ id: "u", type: "user", text: "Continue" }, ...older, compaction, source]
+  const ids = reviewWindow(wide, event)!.map((message: any) => message.id)
+  assert.equal(ids.includes("t0"), false, "older actions are backlog")
+  assert.equal(ids.includes("t19"), true, "the most recent actions are retained")
+
+  // Without a compaction the whole transcript is the window.
+  assert.deepEqual(reviewWindow([{ id: "u", type: "user", text: "hi" }, source], event)?.map((message: any) => message.id),
+    ["u", "msg_source"])
+
+  // A request must rest on at least one user instruction; the summary alone is
+  // context, not authorization.
+  assert.equal(buildReviewRequest([compaction, source], event), undefined)
 })
 
 test("rejects malformed JSON input and ambiguous source identities", () => {

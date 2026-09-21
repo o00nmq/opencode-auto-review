@@ -6,7 +6,6 @@ export type EvidenceRequest =
 
 /** Immutable, session-local evidence. Never executes a tool under review. */
 export function captureEvidence(messages: readonly unknown[], event: PermissionEvent, archive?: {
-  complete: boolean
   result: (messageID: string, toolID: string) => Promise<string | undefined>
 }) {
   const end = messages.findIndex((message) => record(message) && message.id === event.source?.messageID)
@@ -35,10 +34,9 @@ export function captureEvidence(messages: readonly unknown[], event: PermissionE
   // Serialize now: mutable runtime messages must not change an in-flight review.
   const entries = history.map((entry) => JSON.stringify(entry))
   return {
-    authorizationComplete: archive?.complete ?? true,
     authorization: history.flatMap((entry, offset) => record(entry) && entry.type === "user" && typeof entry.text === "string"
       ? [{ offset, text: entry.text }] : []),
-    index: { type: "evidence_index", authorizationComplete: archive?.complete ?? true, historyEntries: entries.length, tools: tools.slice(-64), omittedTools: Math.max(0, tools.length - 64) },
+    index: { type: "evidence_index", historyEntries: entries.length, tools: tools.slice(-64), omittedTools: Math.max(0, tools.length - 64) },
     read(request: EvidenceRequest): unknown {
       if (request.type === "history") {
         const page = entries.slice(request.offset, request.offset + 8).map((entry) => JSON.parse(entry))

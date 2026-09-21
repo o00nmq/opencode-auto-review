@@ -84,9 +84,6 @@ export async function runReviewLoop(input: {
     // Validate before retaining model text; arbitrary output never becomes protocol.
     const decision = parseReviewResponse(result.text)
     if (decision) {
-      if (decision.decision === "allow" && !input.evidence.authorizationComplete) {
-        return unavailable("incomplete_authorization", "Original authorization before compaction is unavailable, so the review could not confirm authorization")
-      }
       if (decision.decision === "allow" && input.evidence.authorization.some((entry) => !disclosedUsers.has(entry.text))) {
         return unavailable("incomplete_authorization", "Original user instructions were omitted from the reviewed context, so the review could not confirm authorization")
       }
