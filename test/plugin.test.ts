@@ -30,6 +30,7 @@ function createHarness(
   generate: string | ((input: any, options: { signal?: AbortSignal }) => Promise<{ text: string }>) = allowText,
   context?: () => Promise<any[]>,
   catalogOverride?: unknown,
+  storageOverride?: { get: (key: string) => Promise<any>; set: (key: string, value: any) => Promise<void> },
 ) {
   let evaluate: ((event: any) => Promise<void>) | undefined
   let command: ((input: any) => Promise<void>) | undefined
@@ -103,12 +104,13 @@ function createHarness(
   // OpenCode 2.0.4 exposes the model domain directly on the plugin context and
   // flattens the transform editor (`editor.get`/`editor.update`), replacing
   // 2.0.2's `ctx.catalog.model` nesting.
+  const storageEntries = new Map<string, any>()
   const ctx = {
     options: pluginOptions,
-    storage: (() => {
-      const entries = new Map<string, any>()
-      return { get: async (key: string) => structuredClone(entries.get(key)), set: async (key: string, value: any) => { entries.set(key, structuredClone(value)) } }
-    })(),
+    storage: storageOverride ?? {
+      get: async (key: string) => structuredClone(storageEntries.get(key)),
+      set: async (key: string, value: any) => { storageEntries.set(key, structuredClone(value)) },
+    },
     permission: {
       hook: async (_name: string, callback: typeof evaluate) => {
         evaluate = callback
@@ -186,6 +188,7 @@ function createHarness(
       return noticeToasts().at(-1)?.description
     },
     counts: () => ({ generateCalls, contextCalls, disposed }),
+    storedJournal: () => structuredClone(storageEntries.get("journal/ses_test")),
     commandDescription: () => commandDescription,
     // Command feedback is an `info` toast now, not a session message.
     visibleStatus: () => noticeToasts().filter((toast) => toast.severity === "info").at(-1)?.description,
@@ -304,7 +307,7 @@ test("only a valid eligible ask can be auto-allowed", async () => {
   assert.equal(harness.rpcDisposed(), 1)
 })
 
-test("retains prior review outcomes per main session", async () => {
+test("a later review keeps the journal body and carries the prior outcome", async () => {
   const harness = createHarness()
   await harness.setup()
   await harness.run()
@@ -315,8 +318,274 @@ test("retains prior review outcomes per main session", async () => {
   await harness.run({ source: { type: "tool", messageID: "assistant2", id: "tool2" } })
   const prompts = harness.generatedPrompts()
   assert.equal(prompts.length, 2)
-  assert.ok(prompts[1]!.startsWith(`${prompts[0]!}\n`))
+  // The prior verdict is retained, but after the journal body: `runReviewLoop`
+  // appends it as an outcome line and the journal carries a compact tail of it.
   assert.match(prompts[1]!, /"type":"review_outcome","code":"allow"/)
+  assert.doesNotMatch(prompts[0]!, /"type":"review_outcome"/)
+  // The cached prefix is the body, and it must not move: the two prompts share
+  // far more than the static policy block alone.
+  let common = 0
+  while (common < prompts[0]!.length && prompts[0]![common] === prompts[1]![common]) common++
+  assert.ok(common > 9_400, `expected a shared body prefix, shared ${common} of ${prompts[0]!.length}`)
+})
+
+test("the journal snapshot is persisted, not only kept in memory", async () => {
+  // A reload, a host that recreates the plugin, or per-session eviction must not
+  // lose the epoch boundary: a rebuild writes a different first line and drops the
+  // provider's cached prefix for the whole journal. The snapshot therefore has to
+  // outlive the in-memory map.
+  const harness = createHarness()
+  await harness.setup()
+  assert.equal(harness.storedJournal(), undefined)
+  await harness.run()
+  const first = harness.storedJournal()
+  assert.ok(first, "the snapshot must be written to storage")
+  assert.equal(first.version, 5)
+  assert.equal(first.sealed, false, "the body is still growing")
+  assert.ok(Array.isArray(first.body) && first.body.length > 0)
+
+  harness.messages[1]!.content[0].state.status = "completed"
+  harness.messages.push({ id: "assistant2", type: "assistant", content: [
+    { type: "tool", id: "tool2", name: "read", state: { status: "running", input: { path: "README.md" } } },
+  ] })
+  await harness.run({ source: { type: "tool", messageID: "assistant2", id: "tool2" } })
+  const second = harness.storedJournal()
+  // The header line is the cached prefix and must not move; the body grows.
+  assert.equal(second.body[0], first.body[0])
+  assert.ok(second.body.length >= first.body.length)
+  assert.equal(second.epoch, 0)
+})
+
+// Seeding helper for the journal tests: a user turn followed by one assistant
+// message per tool, the last left running so it can be the pending request.
+function seedTranscript(harness: ReturnType<typeof createHarness>, tag: string, count: number) {
+  harness.messages.length = 0
+  harness.messages.push({ id: "user", type: "user", text: "Read files" })
+  for (let index = 0; index < count; index++) {
+    harness.messages.push({ id: `${tag}-a-${index}`, type: "assistant", content: [
+      { type: "tool", id: `${tag}-t-${index}`, name: "read",
+        state: { status: index === count - 1 ? "running" : "completed",
+          input: { path: `${"p".repeat(400)}${tag}${index}` } } },
+    ] })
+  }
+}
+
+function runSeeded(harness: ReturnType<typeof createHarness>, tag: string, count: number) {
+  seedTranscript(harness, tag, count)
+  return harness.run({ source: { type: "tool", messageID: `${tag}-a-${count - 1}`, id: `${tag}-t-${count - 1}` } })
+}
+
+test("a recreated instance restores the journal boundary instead of rebuilding", async () => {
+  // This asserts the RESTORE path, not merely that a body exists. The model limit is
+  // narrowed so the initial selection omits history, which means a rebuild rewrites
+  // the header's omission counts. A control instance that cannot read the snapshot
+  // must then produce a DIFFERENT header — otherwise the assertion would pass even
+  // if restoration were broken.
+  const run = (snapshotVisible: boolean) => {
+    const entries = new Map<string, any>()
+    const storage = {
+      get: async (key: string) => snapshotVisible || !key.startsWith("journal/") ? structuredClone(entries.get(key)) : undefined,
+      set: async (key: string, value: any) => { entries.set(key, structuredClone(value)) },
+    }
+    return { entries, storage }
+  }
+  const narrow = (harness: ReturnType<typeof createHarness>) => {
+    harness.catalogModel.limit = { context: 13_000, input: 13_000, output: 1_024 }
+  }
+  const journalOf = (entries: Map<string, any>) => structuredClone(entries.get("journal/ses_test"))
+
+  // Instance A establishes a boundary whose initial selection omitted history.
+  const a = run(true)
+  const first = createHarness({}, allowText, undefined, undefined, a.storage)
+  narrow(first)
+  await first.setup()
+  await runSeeded(first, "x", 61)
+  const snapshot = journalOf(a.entries)
+  assert.ok(snapshot, "the first instance must persist a snapshot")
+  const header = JSON.parse(snapshot.body[0]) as { omitted: { tools: number } }
+  assert.ok(header.omitted.tools > 0, "the initial selection must omit tools so a rebuild would differ")
+
+  // Instance B shares storage and continues the same transcript with more actions.
+  const second = createHarness({}, allowText, undefined, undefined, a.storage)
+  narrow(second)
+  await second.setup()
+  await runSeeded(second, "x", 81)
+  const restored = journalOf(a.entries)
+  assert.equal(restored.epoch, snapshot.epoch, "restoring must not start a new epoch")
+  assert.equal(restored.body[0], snapshot.body[0], "the restored header must match, not be recomputed")
+  assert.deepEqual(restored.body.slice(0, snapshot.body.length), snapshot.body,
+    "the retained body must remain the cached prefix")
+
+  // Control: the same continued transcript with the snapshot hidden rebuilds and
+  // therefore rewrites the header. This is what makes the assertions above real.
+  const lost = run(false)
+  const third = createHarness({}, allowText, undefined, undefined, lost.storage)
+  narrow(third)
+  await third.setup()
+  await runSeeded(third, "x", 81)
+  const rebuilt = journalOf(lost.entries)
+  assert.notEqual(rebuilt.body[0], snapshot.body[0], "a rebuild rewrites the header line")
+})
+
+test("a hung journal read does not wedge the next same-session review", async () => {
+  // The permission hook has a deadline, but the session queue waits for the task to
+  // settle. Only the first journal read is made to hang: the archive must keep
+  // working, and the next same-session review must actually reach the reviewer
+  // instead of being queued behind the stalled one.
+  const entries = new Map<string, any>()
+  const journalReads: string[] = []
+  let hangFirstJournalRead = true
+  const storage = {
+    get: async (key: string) => {
+      if (key.startsWith("journal/")) {
+        journalReads.push(key)
+        if (hangFirstJournalRead) {
+          hangFirstJournalRead = false
+          return new Promise<never>(() => undefined)
+        }
+      }
+      return structuredClone(entries.get(key))
+    },
+    set: async (key: string, value: any) => { entries.set(key, structuredClone(value)) },
+  }
+  const harness = createHarness({ timeoutMs: 1_000 }, allowText, undefined, undefined, storage)
+  await harness.setup()
+  const first = await harness.run({ action: "read", resources: ["a.txt"] })
+  assert.notEqual(first.effect, "allow", "a stalled restore must not approve")
+  const generatedBefore = harness.counts().generateCalls
+  const second = await harness.run({ action: "read", resources: ["b.txt"] })
+  assert.ok(journalReads.length >= 2, "the second review must attempt its own journal read")
+  assert.ok(harness.counts().generateCalls > generatedBefore, "the second review must reach the reviewer")
+  assert.equal(second.effect, "allow", "the second review must complete normally")
+})
+
+test("a delayed journal write cannot overwrite a newer snapshot", async () => {
+  // A write whose review is cancelled still completes, so ordering matters: if a
+  // later review's newer snapshot lands first, the delayed write must not be able
+  // to overtake it and roll the durable journal back to an older boundary.
+  const entries = new Map<string, any>()
+  const journalWrites: any[] = []
+  let releaseFirst!: () => void
+  const gate = new Promise<void>((resolve) => { releaseFirst = resolve })
+  let delayFirst = true
+  const harness = createHarness({ timeoutMs: 1_000 }, allowText, undefined, undefined, {
+    get: async (key: string) => structuredClone(entries.get(key)),
+    set: async (key: string, value: any) => {
+      if (key.startsWith("journal/")) {
+        if (delayFirst) { delayFirst = false; await gate }
+        journalWrites.push(structuredClone(value))
+      }
+      entries.set(key, structuredClone(value))
+    },
+  })
+  await harness.setup()
+  // Both reviews complete normally: persistence is off the review path, so a slow
+  // write must not turn a valid approval into a deadline timeout.
+  const first = await harness.run()
+  assert.equal(first.effect, "allow")
+  harness.messages[1]!.content[0].state.status = "completed"
+  harness.messages.push({ id: "assistant2", type: "assistant", content: [
+    { type: "tool", id: "tool2", name: "read", state: { status: "running", input: { path: "SECOND-MARKER.md" } } },
+  ] })
+  // The second review queues a newer snapshot behind the first.
+  const second = await harness.run({ source: { type: "tool", messageID: "assistant2", id: "tool2" } })
+  assert.equal(second.effect, "allow")
+  assert.equal(journalWrites.length, 0, "both writes must still be waiting on the first")
+  releaseFirst()
+  for (let turn = 0; turn < 12; turn++) await new Promise((done) => setImmediate(done))
+  assert.equal(journalWrites.length, 2, "both snapshots must be written, in order")
+  const [older, newer] = journalWrites
+  assert.ok(newer.body.length > older.body.length,
+    "the second snapshot must be the newer one, so the two are distinguishable")
+  const durable = entries.get("journal/ses_test")
+  assert.ok(durable, "a snapshot must be persisted")
+  // Losing this ordering would let the delayed, older write roll the durable
+  // boundary back to where it was before the second review.
+  assert.equal(durable.body.length, newer.body.length,
+    "the newer snapshot must be the durable one, not the delayed older one")
+})
+
+test("a delayed write from a disposed instance cannot overwrite a newer one", async () => {
+  // A plugin reload disposes one instance and creates another in the same process.
+  // The disposed instance's outstanding write must not be able to roll the durable
+  // journal back after the new instance persisted a newer snapshot.
+  const entries = new Map<string, any>()
+  const written: any[] = []
+  let releaseFirst!: () => void
+  const gate = new Promise<void>((resolve) => { releaseFirst = resolve })
+  let delayFirst = true
+  const storage = {
+    get: async (key: string) => structuredClone(entries.get(key)),
+    set: async (key: string, value: any) => {
+      if (key.startsWith("journal/")) {
+        if (delayFirst) { delayFirst = false; await gate }
+        written.push(structuredClone(value))
+      }
+      entries.set(key, structuredClone(value))
+    },
+  }
+  const first = createHarness({}, allowText, undefined, undefined, storage)
+  const cleanup = await first.setup()
+  await first.run()
+  await cleanup?.()
+
+  const second = createHarness({}, allowText, undefined, undefined, storage)
+  await second.setup()
+  second.messages[1]!.content[0].state.status = "completed"
+  second.messages.push({ id: "assistant2", type: "assistant", content: [
+    { type: "tool", id: "tool2", name: "read", state: { status: "running", input: { path: "README.md" } } },
+  ] })
+  const outcome = await second.run({ source: { type: "tool", messageID: "assistant2", id: "tool2" } })
+  assert.equal(outcome.effect, "allow")
+
+  releaseFirst()
+  for (let turn = 0; turn < 12; turn++) await new Promise((done) => setImmediate(done))
+  assert.equal(written.length, 2, "both snapshots must eventually be written")
+  const [older, newer] = written
+  assert.ok(newer.body.length > older.body.length, "the second snapshot must be the newer one")
+  assert.equal(entries.get("journal/ses_test").body.length, newer.body.length,
+    "the disposed instance's late write must not overwrite the newer snapshot")
+})
+
+test("a rejected journal write does not strand a newer snapshot", async () => {
+  // The write that fails is dropped, but a newer snapshot published while it was in
+  // flight never failed and must still be attempted — without waiting for a third
+  // review to republish it.
+  const entries = new Map<string, any>()
+  const attempts: any[] = []
+  const written: any[] = []
+  let failFirst!: () => void
+  const gate = new Promise<void>((_, reject) => { failFirst = () => reject(new Error("storage down")) })
+  let first = true
+  const harness = createHarness({}, allowText, undefined, undefined, {
+    get: async (key: string) => structuredClone(entries.get(key)),
+    set: async (key: string, value: any) => {
+      if (key.startsWith("journal/")) {
+        attempts.push(structuredClone(value))
+        if (first) { first = false; await gate }
+        written.push(structuredClone(value))
+      }
+      entries.set(key, structuredClone(value))
+    },
+  })
+  await harness.setup()
+  const firstRun = await harness.run()
+  assert.equal(firstRun.effect, "allow")
+  harness.messages[1]!.content[0].state.status = "completed"
+  harness.messages.push({ id: "assistant2", type: "assistant", content: [
+    { type: "tool", id: "tool2", name: "read", state: { status: "running", input: { path: "README.md" } } },
+  ] })
+  const secondRun = await harness.run({ source: { type: "tool", messageID: "assistant2", id: "tool2" } })
+  assert.equal(secondRun.effect, "allow")
+  assert.equal(attempts.length, 1, "only the first write has started so far")
+
+  failFirst()
+  for (let turn = 0; turn < 12; turn++) await new Promise((done) => setImmediate(done))
+  assert.equal(attempts.length, 2, "the newer snapshot must be attempted without another publish")
+  assert.ok(attempts[1].body.length > attempts[0].body.length, "the retried snapshot must be the newer one")
+  assert.equal(written.length, 1, "only the newer snapshot succeeds")
+  assert.equal(entries.get("journal/ses_test").body.length, attempts[1].body.length,
+    "the newer snapshot must end up durable")
 })
 
 test("a request reviewed again after its first notice still notifies", async () => {
@@ -697,18 +966,43 @@ test("plugin modelOptions select a derived variant once across concurrent review
   assert.deepEqual(selected.variants, [])
 })
 
-test("default Chat budget preserves the selected native reasoning variant", async () => {
-  const harness = createHarness({ model: "test/reviewer#max" }, async (input) => {
+test("an explicit request body is applied to the derived variant, not the base model", async () => {
+  // No body is written by default (the cap field is protocol-specific), so a body
+  // is only present when the caller names one. It must reach the derived variant
+  // while the base model and native variant stay untouched.
+  const harness = createHarness({
+    model: "test/reviewer#max",
+    modelOptions: { body: { max_output_tokens: 2048 } },
+  }, async (input) => {
     const variant = harness.catalogModel.variants.find((entry: any) => entry.id === input.model.variant)
-    assert.equal(variant.body.max_tokens, 2048)
+    assert.deepEqual(variant.body, { reasoning: { effort: "high" }, max_output_tokens: 2048 })
     assert.deepEqual(variant.settings, { reasoningEffort: "high" })
-    assert.deepEqual(variant.body.reasoning, { effort: "high" })
     assert.equal(harness.catalogModel.variants[0].id, "max")
-    assert.equal(harness.catalogModel.variants[0].body.max_tokens, undefined)
+    assert.equal(harness.catalogModel.variants[0].body.max_output_tokens, undefined)
     return { text: allowText }
   })
   const cleanup = await harness.setup()
   assert.equal((await harness.run()).effect, "allow")
+  await cleanup?.()
+})
+
+test("the default configuration registers no request overrides", async () => {
+  // Registering nothing is deliberate: a guessed output-cap field is protocol
+  // specific and would silently leave the reviewer output unbounded. The generate
+  // call must therefore carry no request body of its own.
+  let registrations = 0
+  const selected: any = { providerID: "test", id: "reviewer", limit: { context: 128_000, output: 8192 }, variants: [] }
+  const modelDomain = {
+    transform: async () => { registrations++; return { dispose: async () => undefined } },
+    list: async () => ({ data: [selected] }),
+  }
+  const harness = createHarness({}, (input) => {
+    assert.equal(input.body, undefined, "no request body override is sent by default")
+    return Promise.resolve({ text: allowText })
+  }, undefined, modelDomain)
+  const cleanup = await harness.setup()
+  assert.equal((await harness.run()).effect, "allow")
+  assert.equal(registrations, 0, "the default must not invent a protocol-specific body")
   await cleanup?.()
 })
 

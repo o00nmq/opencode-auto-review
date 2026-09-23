@@ -30,7 +30,7 @@ Choose a reviewer model in `opencode.json(c)`. Replace the example with an avail
 
 The model is optional: the plugin falls back to the `auto-reviewer` agent's model, then OpenCode's default. Notices are CLI toasts, so nothing is ever written to the session and an idle session is never resumed. Notices never change the permission decision.
 
-Automatic review is enabled by default, with **2,048 output tokens** and **90 seconds total per request**. Change these with `maxReviewTokens` and `timeoutMs`. The default output parameter targets Chat Completions; see [advanced configuration](DESIGN.md#configuration) for other APIs and human-only rules.
+Automatic review is enabled by default, with a **2,048-token prompt-side output budget** and **90 seconds total per request**. Change these with `maxReviewTokens` and `timeoutMs`. The plugin sets no provider request cap by default, because the correct field is protocol-specific and a wrong guess is silently ignored; see [advanced configuration](DESIGN.md#configuration) for naming the field for your API and for human-only rules.
 
 ## Usage
 

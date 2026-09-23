@@ -36,11 +36,25 @@ export interface ReviewDecision {
   matched_rules: string[]
 }
 
+/**
+ * Persisted reviewer journal. `body` is the cached prompt prefix for the current
+ * compaction epoch; `sourceLength`/`sourceDigest` mark the snapshot boundary it
+ * was selected from. Per-review lines (the pending tool, the evidence index, and
+ * loop lines) are derived and never stored.
+ */
 export interface ReviewerJournalState {
   checkpoint?: string
-  version: 3
+  version: 5
   epoch: number
   sourceLength: number
   sourceDigest: string
-  lines: string[]
+  body: string[]
+  /**
+   * True once the body has stopped growing. Persisted so the seal survives a
+   * reload: without it, a later small request could fall back into the growing
+   * phase and restart the churn this state exists to prevent.
+   */
+  sealed: boolean
+  /** Compact prior verdicts for this epoch, newest last. */
+  outcomes: string[]
 }

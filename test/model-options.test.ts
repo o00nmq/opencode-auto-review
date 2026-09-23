@@ -28,18 +28,17 @@ function catalog() {
   return { api: api as any, source, current: () => current, replay }
 }
 
-test("Chat Completions is the default body budget and explicit bodies replace that default", () => {
-  assert.deepEqual(parseOptions({}).modelOptions, { body: { max_tokens: 2048 } })
-  assert.deepEqual(parseOptions(undefined).modelOptions, { body: { max_tokens: 2048 } })
-  assert.deepEqual(parseOptions({ maxReviewTokens: 1024 }).modelOptions, { body: { max_tokens: 1024 } })
+test("no request body is written by default; an explicit body passes through unchanged", () => {
+  // The output-cap field is protocol-specific, and `body` is a raw HTTP overlay,
+  // so the plugin does not guess one. Anything the user names is sent verbatim.
+  assert.deepEqual(parseOptions({}).modelOptions, undefined)
+  assert.deepEqual(parseOptions(undefined).modelOptions, undefined)
+  assert.deepEqual(parseOptions({ maxReviewTokens: 1024 }).modelOptions, undefined)
   assert.deepEqual(parseOptions({ modelOptions: { settings: { reasoningEffort: "low" } } }).modelOptions,
-    { settings: { reasoningEffort: "low" }, body: { max_tokens: 2048 } })
+    { settings: { reasoningEffort: "low" } })
   for (const body of [{ max_output_tokens: 512 }, { max_completion_tokens: 512 }, {}]) {
     assert.deepEqual(parseOptions({ modelOptions: { body } }).modelOptions?.body, body)
   }
-  const options = parseOptions({})
-  options.modelOptions!.body!.max_tokens = 1
-  assert.equal(parseOptions({}).modelOptions?.body?.max_tokens, 2048)
 })
 
 test("derived reviewer variant deep-merges overrides without changing original model or variant", async () => {

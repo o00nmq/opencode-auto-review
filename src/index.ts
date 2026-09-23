@@ -12,12 +12,73 @@ import {
   parseOptions,
 } from "./policy.js"
 import { buildReviewRequest } from "./review-input.js"
-import { prepareReviewJournal } from "./reviewer-journal.js"
+import { OUTCOME_TAIL, prepareReviewJournal } from "./reviewer-journal.js"
 import { AutoReview } from "./rpc.js"
 import type { PermissionEvent, ReviewerJournalState, ReviewRequest } from "./types.js"
 
 const FAILURE_MESSAGE = "The request could not be verified for automatic approval."
 const REVIEWER_FAILURE_MESSAGE = "Automatic review did not return a complete valid decision. This is not a safety judgment about the requested action."
+
+/**
+ * Where the reviewer journal snapshot for a session is persisted. It must outlive
+ * the in-memory map: a lost snapshot rebuilds the journal, and a rebuild writes a
+ * different first line, which invalidates the provider's cached prefix for the
+ * whole journal.
+ */
+function journalKey(sessionID: string): string {
+  return `journal/${sessionID}`
+}
+
+/**
+ * Journal persistence.
+ *
+ * It is deliberately **best-effort and off the review path**: the in-memory map is
+ * authoritative for the running instance, so a storage failure must never turn a
+ * valid approval into a timeout or block the next review in the session.
+ *
+ * Ordering is what makes it safe. The queue holds at most one snapshot per session
+ * (the newest, so a single hung or failing session cannot accumulate a backlog),
+ * and a single drain loop per session writes them one at a time — a newer snapshot
+ * can never be overtaken by an older write that finishes later, whether the late
+ * write comes from this instance or from one that has already been recreated. The
+ * state is at module scope precisely so a recreated instance in the same process
+ * shares the same queue and drain loop. The bound is per session: each session
+ * with an outstanding write contributes at most one pending entry and one drain
+ * flag, so the total is proportional to sessions with unflushed snapshots, not to
+ * the number of reviews.
+ */
+const journalPending = new Map<string, Parameters<Plugin.Context["storage"]["set"]>[1]>()
+const journalDraining = new Set<string>()
+
+function publishJournal(storage: Plugin.Context["storage"], sessionID: string, snapshot: ReviewerJournalState): void {
+  // Clone at publish time, so a later mutation cannot change what is queued.
+  journalPending.set(sessionID, JSON.parse(JSON.stringify(snapshot)))
+  void drainJournal(storage, sessionID)
+}
+
+async function drainJournal(storage: Plugin.Context["storage"], sessionID: string): Promise<void> {
+  if (journalDraining.has(sessionID)) return
+  journalDraining.add(sessionID)
+  try {
+    for (;;) {
+      const snapshot = journalPending.get(sessionID)
+      if (snapshot === undefined) return
+      // Remove it before writing: a snapshot published while this write is in
+      // flight stays queued and is picked up by the next iteration.
+      journalPending.delete(sessionID)
+      try {
+        await storage.set(journalKey(sessionID), snapshot)
+      } catch {
+        // This one snapshot is dropped. Keep draining rather than returning: a newer
+        // snapshot published while this write was in flight never failed and must
+        // still be attempted. The loop ends by itself once nothing is pending.
+        continue
+      }
+    }
+  } finally {
+    journalDraining.delete(sessionID)
+  }
+}
 
 /** How the CLI presents a reviewer notice. */
 type NoticeSeverity = "success" | "info" | "warning" | "error"
@@ -370,11 +431,38 @@ export default Plugin.define({
       const selectedModel = resolved.model
       const catalog = await raceWithAbort(ctx.model.list({}, { signal }), signal)
       const info = catalog.data.find((item) => item.providerID === selectedModel.providerID && item.id === selectedModel.id)
-      const variant = info?.variants.find((item) => item.id === selectedModel.variant)
-      const maxInputTokens = inputTokenBudget(info?.limit, { ...info?.body, ...variant?.body })
+      // Availability is validated here rather than only inside the override
+      // registration, because the default configuration registers nothing: without
+      // this an unknown model or variant would fall through to a misleading
+      // "input budget" error instead of the real reason.
+      if (!info) {
+        return { code: "model_unavailable",
+          message: `Automatic review could not resolve a reviewer model: reviewer model ${selectedModel.providerID}/${selectedModel.id} is not available`,
+          notices }
+      }
+      const variant = info.variants.find((item) => item.id === selectedModel.variant)
+      if (selectedModel.variant && !variant) {
+        return { code: "model_unavailable",
+          message: `Automatic review could not resolve a reviewer model: reviewer variant "${selectedModel.variant}" is not available for ${selectedModel.providerID}/${selectedModel.id}`,
+          notices }
+      }
+      const maxInputTokens = inputTokenBudget(info.limit, { ...info.body, ...variant?.body })
       if (!maxInputTokens) return { code: "context_limit", message: "Reviewer model has no usable input budget after reserving output tokens", notices }
+      // The in-memory map is authoritative for this instance. Storage is the
+      // surviving copy across a reload or a recreated instance, and because a lost
+      // snapshot rebuilds the journal — which rewrites the header line and
+      // invalidates the provider's cached prefix for the whole journal — it is
+      // worth reading. Both waits race the review signal: a storage operation that
+      // never settles must not hold this session's queue open, or one stalled read
+      // would wedge every later review in the session.
+      let current: ReviewerJournalState | undefined = reviewerStates.get(sessionID)
+      if (!current) {
+        const restored = await raceWithAbort(ctx.storage.get(journalKey(sessionID)), signal)
+          .catch(() => undefined) as ReviewerJournalState | undefined
+        current = reviewerStates.get(sessionID) ?? restored
+      }
       const prepared = prepareReviewJournal(
-        reviewerStates.get(sessionID),
+        current,
         request,
         Math.floor(maxInputTokens * 0.75) - estimateTokens(JSON.stringify(evidence.index)),
         options.maxReviewTokens,
@@ -382,9 +470,9 @@ export default Plugin.define({
       if (!prepared) {
         return { code: "context_limit", message: "The review window (user instructions, recent actions, and the current request) does not fit the reviewer model's input budget", notices }
       }
-      const { prompt: _prompt, ...state } = prepared
+      const { prompt: _prompt, lines, ...state } = prepared
       const outcome = await runReviewLoop({
-        lines: state.lines,
+        lines,
         evidence,
         options,
         maxInputTokens,
@@ -394,10 +482,23 @@ export default Plugin.define({
         onRound: (round, outcome) => diagnose({ sessionID, round: String(round), outcome }),
       })
       if (!signal.aborted) {
+        // Persist the snapshot plus a compact verdict tail only. Loop lines
+        // (evidence, reviewer rounds, the full outcome) are per-review; storing
+        // them would move the cached prefix on every review, which is exactly what
+        // the sealed body exists to prevent.
+        const verdict = JSON.stringify(outcome.decision
+          ? { type: "review_outcome", code: outcome.code, decision: outcome.decision }
+          : { type: "review_outcome", code: outcome.code })
+        const saved = { ...state, outcomes: [...state.outcomes, verdict].slice(-OUTCOME_TAIL) }
         reviewerStates.delete(sessionID)
-        reviewerStates.set(sessionID, { ...state, lines: outcome.lines })
-        // Bound retained session state. Eviction rebuilds from source history.
+        reviewerStates.set(sessionID, saved)
+        // Bound retained session state. Evicted sessions restore from storage when
+        // possible, otherwise they rebuild.
         if (reviewerStates.size > 128) reviewerStates.delete(reviewerStates.keys().next().value!)
+        // Best-effort: the in-memory map above is authoritative for this instance,
+        // so persistence is off the review path. Awaiting it would let a slow or
+        // hung storage turn a valid approval into a deadline timeout.
+        publishJournal(ctx.storage, sessionID, saved)
       }
       return notices.length ? { ...outcome, notices } : outcome
     }
