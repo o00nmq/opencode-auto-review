@@ -1,6 +1,6 @@
 {
   "name": "opencode-auto-review",
-  "version": "0.4.8",
+  "version": "0.4.9",
   "description": "Fail-safe automatic review for OpenCode V2 permission prompts",
   "keywords": [
     "opencode",
